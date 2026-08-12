@@ -1,31 +1,40 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 # ============================================================
-# Standalone Gensim HDP Pipeline for Google Colab
-# - Google Drive mount
-# - Package installation
-# - Train/test BoW and vocabulary loading
-# - Fixed training sample across seeds
-# - HDP training for seeds 42, 43, 44
-# - Batch-wise full theta inference
-# - Per-seed evaluation: Pur_p, Pur_a, NMI
-# - Model/theta/metrics saving
-# - No invalid raw-theta averaging across seeds
+# Standalone Gensim HDP Baseline
+# - Google Drive mount when running in Colab
+# - Fixed 50,000-document training subset
+# - Seeds: 42, 43, 44
+# - Claim-level theta inference
+# - Claim theta -> patent theta aggregation
+# - Patent-level CPC evaluation: Pur_p, Pur_a, NMI
+# - Per-seed and mean ± std saving
+# - No invalid theta averaging across seeds
 # ============================================================
 
 # ============================================================
-# 0. Google Drive 마운트
+# 0. Google Drive mount
 # ============================================================
-from google.colab import drive
-drive.mount("/content/drive", force_remount=False)
+try:
+    from google.colab import drive
+
+    drive.mount(
+        "/content/drive",
+        force_remount=False,
+    )
+except ImportError:
+    print("[INFO] Not running in Colab; Drive mount skipped.")
 
 
 # ============================================================
-# 1. 패키지 설치
+# 1. Package installation
 # ============================================================
 import sys
 import subprocess
 import importlib.util
 
-required_packages = {
+REQUIRED_PACKAGES = {
     "gensim": "gensim",
     "sklearn": "scikit-learn",
     "scipy": "scipy",
@@ -35,17 +44,23 @@ required_packages = {
 
 missing_packages = [
     pip_name
-    for module_name, pip_name in required_packages.items()
+    for module_name, pip_name in REQUIRED_PACKAGES.items()
     if importlib.util.find_spec(module_name) is None
 ]
 
 if missing_packages:
-    print("Installing missing packages:", missing_packages)
-    subprocess.check_call(
-        [sys.executable, "-m", "pip", "install", "-q", *missing_packages]
-    )
+    print("Installing:", missing_packages)
+
+    subprocess.check_call([
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "-q",
+        *missing_packages,
+    ])
 else:
-    print("[PASS] Required packages are already installed.")
+    print("[PASS] Required packages are installed.")
 
 
 # ============================================================
@@ -76,54 +91,68 @@ from tqdm.auto import tqdm
 
 
 # ============================================================
-# 3. 사용자 설정
+# 3. Configuration
 # ============================================================
+PROJECT_ROOT = Path(
+    os.environ.get(
+        "DEPTH_OT_ROOT",
+        "/content/drive/MyDrive/depth_ot_patent",
+    )
+)
 
-# 프로젝트 루트
-PROJECT_ROOT = Path("/content/drive/MyDrive/depth_ot_patent")
+# Input
+TRAIN_BOW_PATH = (
+    PROJECT_ROOT
+    / "data"
+    / "processed"
+    / "bow_train.npz"
+)
 
-# ------------------------------------------------------------
-# 데이터 파일 경로
-# ------------------------------------------------------------
-# 정확한 경로를 알고 있다면 문자열로 지정하세요.
-# None이면 PROJECT_ROOT 안에서 알려진 파일명을 자동으로 찾습니다.
-#
-# 예:
-# TRAIN_BOW_PATH = PROJECT_ROOT / "data/bow_train.npz"
-# TEST_BOW_PATH  = PROJECT_ROOT / "data/bow_test.npz"
-# VOCAB_PATH     = PROJECT_ROOT / "data/vocab.pkl"
-# TEST_LABEL_PATH = PROJECT_ROOT / "data/test_labels.csv"
+TEST_BOW_PATH = (
+    PROJECT_ROOT
+    / "data"
+    / "processed"
+    / "bow_test.npz"
+)
 
-TRAIN_BOW_PATH = None
-TEST_BOW_PATH = None
-VOCAB_PATH = PROJECT_ROOT / "data" / "processed" / "vocab.pkl"
+VOCAB_PATH = (
+    PROJECT_ROOT
+    / "data"
+    / "processed"
+    / "vocab.pkl"
+)
 
-# CPC 평가를 하지 않으려면 None으로 두세요.
-# 자동 탐색하지 않고, 명시적으로 지정하는 것을 권장합니다.
-TEST_LABEL_PATH = None
+TEST_RECORDS_PATH = (
+    PROJECT_ROOT
+    / "data"
+    / "processed"
+    / "test_records.pkl"
+)
 
-# CSV에 여러 CPC 계층 열이 있다면 여기에 지정합니다.
-# None이면 로드된 모든 열을 평가합니다.
-#
-# 예:
-# LABEL_COLUMNS = ["section", "class", "subclass"]
-LABEL_COLUMNS = None
+REF_TEST_PATH = (
+    PROJECT_ROOT
+    / "data"
+    / "processed"
+    / "ref_test.pkl"
+)
 
+# 다른 baseline과 동일한 CPC reference
+CPC_REFERENCE_PATH = (
+    PROJECT_ROOT
+    / "results"
+    / "cpc_alignment"
+    / "etm_patent_predictions_by_seed.csv"
+)
 
-# ------------------------------------------------------------
-# HDP 설정
-# ------------------------------------------------------------
+# HDP
 SEEDS = [42, 43, 44]
 
-# 모든 seed가 동일한 5만 개 문서를 사용
 HDP_SAMPLE_SEED = 42
 HDP_TRAIN_SAMPLE_SIZE = 50_000
 
-# HDP truncation 설정
 HDP_T = 150
 HDP_K = 15
 
-# 온라인 HDP 설정
 HDP_CHUNKSIZE = 1000
 HDP_KAPPA = 0.9
 HDP_TAU = 64.0
@@ -131,708 +160,529 @@ HDP_ALPHA = 1.0
 HDP_GAMMA = 1.0
 HDP_ETA = 0.01
 
-# 테스트 theta 추론 배치
 HDP_INFERENCE_BATCH_SIZE = 2000
+TOP_WORDS = 20
 
-# 기존 학습 모델이 있으면 재사용
+# Resume
 REUSE_EXISTING_MODEL = True
+REUSE_EXISTING_THETA = True
+SAVE_MODEL = True
 
-# theta가 이미 있어도 다시 추론할지 여부
-FORCE_REINFERENCE = False
-
-# 모델 저장 여부
-SAVE_HDP_MODEL = True
-
-# 로그 수준
-#logging.getLogger("gensim").setLevel(logging.WARNING)
-logging.getLogger("gensim.models.hdpmodel").setLevel(logging.ERROR)
+# Logging
+logging.getLogger("gensim").setLevel(logging.ERROR)
+logging.getLogger(
+    "gensim.models.hdpmodel"
+).setLevel(logging.ERROR)
 
 
 # ============================================================
-# 4. 결과 폴더 생성
+# 4. Directories
 # ============================================================
-RUN_TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
-RUN_NAME = f"hdp_standalone_{RUN_TIMESTAMP}"
-
 HDP_ROOT = PROJECT_ROOT / "topic_model" / "hdp"
+
 MODEL_DIR = HDP_ROOT / "models"
 THETA_DIR = HDP_ROOT / "theta"
-RESULT_DIR = HDP_ROOT / "results"
+TOPIC_DIR = HDP_ROOT / "topics"
 LOG_DIR = HDP_ROOT / "logs"
 SAMPLE_DIR = HDP_ROOT / "samples"
+
+CPC_RESULT_DIR = (
+    PROJECT_ROOT
+    / "results"
+    / "cpc_alignment"
+)
 
 for directory in [
     HDP_ROOT,
     MODEL_DIR,
     THETA_DIR,
-    RESULT_DIR,
+    TOPIC_DIR,
     LOG_DIR,
     SAMPLE_DIR,
+    CPC_RESULT_DIR,
 ]:
-    directory.mkdir(parents=True, exist_ok=True)
+    directory.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-RUN_LOG_PATH = LOG_DIR / f"{RUN_NAME}.json"
-METRICS_CSV_PATH = RESULT_DIR / f"{RUN_NAME}_metrics.csv"
-SUMMARY_JSON_PATH = RESULT_DIR / f"{RUN_NAME}_summary.json"
 SAMPLE_IDX_PATH = SAMPLE_DIR / (
     f"hdp_train_sample_idx_n{HDP_TRAIN_SAMPLE_SIZE}"
     f"_seed{HDP_SAMPLE_SEED}.npy"
 )
 
-print("\n=== Output directories ===")
-print("Project root :", PROJECT_ROOT)
-print("HDP root     :", HDP_ROOT)
-print("Model dir    :", MODEL_DIR)
-print("Theta dir    :", THETA_DIR)
-print("Result dir   :", RESULT_DIR)
-print("Log dir      :", LOG_DIR)
+METRICS_PATH = (
+    CPC_RESULT_DIR
+    / "hdp_patent_cpc_alignment_by_seed.csv"
+)
+
+METRIC_SUMMARY_CSV_PATH = (
+    CPC_RESULT_DIR
+    / "hdp_patent_cpc_alignment_summary.csv"
+)
+
+SUMMARY_JSON_PATH = (
+    CPC_RESULT_DIR
+    / "hdp_patent_cpc_alignment_summary.json"
+)
+
+PREDICTIONS_PATH = (
+    CPC_RESULT_DIR
+    / "hdp_patent_predictions_by_seed.csv"
+)
+
+ERROR_LOG_PATH = (
+    LOG_DIR
+    / "hdp_baseline_errors.txt"
+)
 
 
 # ============================================================
-# 5. 파일 탐색 유틸리티
+# 5. Atomic save
 # ============================================================
-def resolve_data_path(explicit_path, candidate_names, description, required=True):
-    """
-    명시적 경로가 있으면 그것을 사용하고,
-    없으면 PROJECT_ROOT 아래에서 후보 파일명을 탐색합니다.
-    """
-    if explicit_path is not None:
-        path = Path(explicit_path)
+def atomic_save_json(obj, path):
+    path = Path(path)
+    temporary_path = path.with_suffix(
+        path.suffix + ".tmp"
+    )
 
+    with open(
+        temporary_path,
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(
+            obj,
+            file,
+            ensure_ascii=False,
+            indent=2,
+        )
+        file.flush()
+        os.fsync(file.fileno())
+
+    os.replace(temporary_path, path)
+
+
+def atomic_save_npy(array, path):
+    path = Path(path)
+    temporary_path = path.with_suffix(
+        path.suffix + ".tmp"
+    )
+
+    with open(temporary_path, "wb") as file:
+        np.save(file, array)
+        file.flush()
+        os.fsync(file.fileno())
+
+    os.replace(temporary_path, path)
+
+
+# ============================================================
+# 6. Data loading
+# ============================================================
+def validate_required_files():
+    required_files = {
+        "Train BoW": TRAIN_BOW_PATH,
+        "Test BoW": TEST_BOW_PATH,
+        "Vocabulary": VOCAB_PATH,
+        "Test records": TEST_RECORDS_PATH,
+        "Test reference": REF_TEST_PATH,
+        "CPC reference": CPC_REFERENCE_PATH,
+    }
+
+    missing = []
+
+    for name, path in required_files.items():
         if not path.is_file():
-            raise FileNotFoundError(
-                f"{description} 파일이 없습니다:\n{path}"
-            )
+            missing.append(f"{name}: {path}")
 
-        return path
-
-    matches = []
-
-    for candidate_name in candidate_names:
-        matches.extend(PROJECT_ROOT.rglob(candidate_name))
-
-    # 중복 제거
-    unique_matches = sorted(
-        set(path.resolve() for path in matches),
-        key=lambda x: str(x)
-    )
-
-    if len(unique_matches) == 1:
-        print(f"[AUTO] {description}: {unique_matches[0]}")
-        return Path(unique_matches[0])
-
-    if len(unique_matches) == 0:
-        if required:
-            raise FileNotFoundError(
-                f"\n{description} 파일을 자동으로 찾지 못했습니다.\n"
-                f"PROJECT_ROOT: {PROJECT_ROOT}\n"
-                f"찾은 파일명 후보: {candidate_names}\n\n"
-                f"코드 상단에서 경로를 직접 지정하세요."
-            )
-
-        return None
-
-    print(f"\n[WARNING] {description} 후보가 여러 개 발견되었습니다.")
-
-    for index, path in enumerate(unique_matches, start=1):
-        print(f"  {index}. {path}")
-
-    raise RuntimeError(
-        f"\n{description} 후보가 여러 개입니다. "
-        f"코드 상단에서 정확한 경로를 직접 지정하세요."
-    )
-
-
-TRAIN_BOW_PATH = resolve_data_path(
-    TRAIN_BOW_PATH,
-    candidate_names=[
-        "bow_train.npz",
-        "train_bow.npz",
-        "bow_train.pkl",
-        "train_bow.pkl",
-        "bow_train.pickle",
-        "train_bow.pickle",
-    ],
-    description="Train BoW",
-    required=True,
-)
-
-TEST_BOW_PATH = resolve_data_path(
-    TEST_BOW_PATH,
-    candidate_names=[
-        "bow_test.npz",
-        "test_bow.npz",
-        "bow_test.pkl",
-        "test_bow.pkl",
-        "bow_test.pickle",
-        "test_bow.pickle",
-    ],
-    description="Test BoW",
-    required=True,
-)
-
-VOCAB_PATH = resolve_data_path(
-    VOCAB_PATH,
-    candidate_names=[
-        "vocab.pkl",
-        "vocabulary.pkl",
-        "vocab.pickle",
-        "vocabulary.pickle",
-        "vocab.npy",
-        "vocabulary.npy",
-        "vocab.json",
-        "vocabulary.json",
-        "vocab.txt",
-        "vocabulary.txt",
-    ],
-    description="Vocabulary",
-    required=True,
-)
-
-if TEST_LABEL_PATH is not None:
-    TEST_LABEL_PATH = resolve_data_path(
-        TEST_LABEL_PATH,
-        candidate_names=[],
-        description="Test CPC labels",
-        required=True,
-    )
-
-
-# ============================================================
-# 6. 데이터 로드 유틸리티
-# ============================================================
-def unwrap_sparse_object(obj, preferred_keys=None):
-    """
-    pickle 내부가 sparse matrix 자체이거나,
-    dictionary 형태인 경우 sparse matrix를 추출합니다.
-    """
-    if sp.issparse(obj):
-        return obj
-
-    if preferred_keys is None:
-        preferred_keys = [
-            "bow",
-            "matrix",
-            "data",
-            "x",
-            "X",
-            "train_bow",
-            "test_bow",
-            "bow_train",
-            "bow_test",
-        ]
-
-    if isinstance(obj, dict):
-        for key in preferred_keys:
-            if key in obj and sp.issparse(obj[key]):
-                return obj[key]
-
-        sparse_values = [
-            value for value in obj.values()
-            if sp.issparse(value)
-        ]
-
-        if len(sparse_values) == 1:
-            return sparse_values[0]
-
-    raise TypeError(
-        "파일에서 scipy sparse matrix를 추출하지 못했습니다. "
-        f"로드된 객체 타입: {type(obj)}"
-    )
+    if missing:
+        raise FileNotFoundError(
+            "Required files are missing:\n"
+            + "\n".join(missing)
+        )
 
 
 def load_sparse_matrix(path):
-    path = Path(path)
-    suffix = path.suffix.lower()
-
     print(f"Loading sparse matrix: {path}")
 
-    if suffix == ".npz":
-        matrix = sp.load_npz(path)
-
-    elif suffix in {".pkl", ".pickle"}:
-        with open(path, "rb") as file:
-            obj = pickle.load(file)
-
-        matrix = unwrap_sparse_object(obj)
-
-    else:
-        raise ValueError(
-            f"지원하지 않는 sparse matrix 형식입니다: {suffix}"
-        )
-
-    matrix = matrix.tocsr()
+    matrix = sp.load_npz(path).tocsr()
+    matrix.sort_indices()
 
     if matrix.ndim != 2:
         raise ValueError(
-            f"BoW matrix는 2차원이어야 합니다: shape={matrix.shape}"
+            f"Expected 2-D matrix: {matrix.shape}"
         )
 
-    if matrix.data.size > 0:
+    if matrix.data.size:
         if not np.isfinite(matrix.data).all():
             raise FloatingPointError(
-                f"{path.name}에 NaN 또는 Inf가 있습니다."
+                f"{path.name} contains NaN/Inf."
             )
 
         if np.any(matrix.data < 0):
             raise ValueError(
-                f"{path.name}에 음수 BoW 값이 있습니다."
+                f"{path.name} contains negative values."
             )
-
-    matrix.sort_indices()
 
     return matrix
 
 
-def normalize_vocab_object(obj):
-    """
-    다양한 vocab 저장 형식을 id 순서의 문자열 리스트로 변환합니다.
-    """
+def normalize_vocabulary(obj):
     if isinstance(obj, np.ndarray):
         obj = obj.tolist()
 
     if isinstance(obj, pd.Series):
         obj = obj.tolist()
 
-    if isinstance(obj, pd.DataFrame):
-        if obj.shape[1] != 1:
-            raise ValueError(
-                "Vocabulary DataFrame에는 열이 하나만 있어야 합니다."
-            )
-
-        obj = obj.iloc[:, 0].tolist()
-
     if isinstance(obj, (list, tuple)):
         return [str(word) for word in obj]
 
     if isinstance(obj, dict):
-        # {integer_id: word}
-        if all(isinstance(key, (int, np.integer)) for key in obj.keys()):
-            ordered_keys = sorted(obj.keys())
-            return [str(obj[key]) for key in ordered_keys]
+        # {id: word}
+        if all(
+            isinstance(key, (int, np.integer))
+            for key in obj
+        ):
+            return [
+                str(obj[key])
+                for key in sorted(obj)
+            ]
 
-        # {word: integer_id}
-        if all(isinstance(value, (int, np.integer)) for value in obj.values()):
-            sorted_items = sorted(
-                obj.items(),
-                key=lambda item: int(item[1])
-            )
-            return [str(word) for word, _ in sorted_items]
+        # {word: id}
+        if all(
+            isinstance(value, (int, np.integer))
+            for value in obj.values()
+        ):
+            return [
+                str(word)
+                for word, _ in sorted(
+                    obj.items(),
+                    key=lambda item: int(item[1]),
+                )
+            ]
 
-        # {"vocab": [...]}, {"words": [...]}
-        for key in ["vocab", "vocabulary", "words", "tokens", "id2word"]:
+        for key in [
+            "vocab",
+            "vocabulary",
+            "words",
+            "tokens",
+            "id2word",
+        ]:
             if key in obj:
-                return normalize_vocab_object(obj[key])
+                return normalize_vocabulary(obj[key])
 
-    # Gensim Dictionary 형태
-    if hasattr(obj, "id2token") and obj.id2token:
+    if hasattr(obj, "token2id"):
         return [
-            str(obj.id2token[index])
-            for index in range(len(obj.id2token))
+            str(word)
+            for word, _ in sorted(
+                obj.token2id.items(),
+                key=lambda item: int(item[1]),
+            )
         ]
 
-    if hasattr(obj, "token2id") and obj.token2id:
-        sorted_items = sorted(
-            obj.token2id.items(),
-            key=lambda item: int(item[1])
-        )
-        return [str(word) for word, _ in sorted_items]
-
     raise TypeError(
-        "Vocabulary 객체를 문자열 리스트로 변환하지 못했습니다. "
-        f"타입: {type(obj)}"
+        f"Unsupported vocabulary type: {type(obj)}"
     )
 
 
 def load_vocabulary(path):
-    path = Path(path)
-    suffix = path.suffix.lower()
-
     print(f"Loading vocabulary: {path}")
 
-    if suffix in {".pkl", ".pickle"}:
-        with open(path, "rb") as file:
-            obj = pickle.load(file)
+    with open(path, "rb") as file:
+        obj = pickle.load(file)
 
-    elif suffix == ".npy":
-        obj = np.load(path, allow_pickle=True)
+    vocabulary = normalize_vocabulary(obj)
 
-    elif suffix == ".json":
-        with open(path, "r", encoding="utf-8") as file:
-            obj = json.load(file)
+    if not vocabulary:
+        raise ValueError("Vocabulary is empty.")
 
-    elif suffix == ".txt":
-        with open(path, "r", encoding="utf-8") as file:
-            obj = [
-                line.rstrip("\n")
-                for line in file
-                if line.strip()
-            ]
-
-    else:
-        raise ValueError(
-            f"지원하지 않는 vocabulary 형식입니다: {suffix}"
-        )
-
-    vocab_list = normalize_vocab_object(obj)
-
-    if len(vocab_list) == 0:
-        raise ValueError("Vocabulary가 비어 있습니다.")
-
-    return vocab_list
+    return vocabulary
 
 
-def load_labels(path):
-    """
-    CPC test labels를 DataFrame으로 반환합니다.
-    """
-    if path is None:
-        return None
+# ============================================================
+# 7. Patent ID/reference handling
+# ============================================================
+PATENT_ID_KEYS = [
+    "patent_id",
+    "patent_ids",
+    "publication_number",
+    "doc_id",
+    "document_id",
+]
 
-    path = Path(path)
-    suffix = path.suffix.lower()
 
-    print(f"Loading test labels: {path}")
+def normalize_patent_ids(values):
+    normalized = (
+        pd.Series(np.asarray(values).ravel())
+        .astype(str)
+        .str.strip()
+        .str.replace(r"\.0$", "", regex=True)
+        .to_numpy()
+    )
 
-    if suffix == ".csv":
-        labels = pd.read_csv(path)
+    return normalized
 
-    elif suffix == ".parquet":
-        labels = pd.read_parquet(path)
 
-    elif suffix == ".npy":
-        values = np.load(path, allow_pickle=True)
+def extract_record_patent_ids(records):
+    if isinstance(records, pd.DataFrame):
+        for key in PATENT_ID_KEYS:
+            if key in records.columns:
+                return normalize_patent_ids(
+                    records[key].to_numpy()
+                )
 
-        if values.ndim == 1:
-            labels = pd.DataFrame({"label": values})
-        else:
-            labels = pd.DataFrame(values)
+    if isinstance(records, dict):
+        for key in PATENT_ID_KEYS:
+            if key in records:
+                return normalize_patent_ids(
+                    records[key]
+                )
 
-    elif suffix in {".pkl", ".pickle"}:
-        with open(path, "rb") as file:
-            obj = pickle.load(file)
+        for nested_key in [
+            "records",
+            "data",
+            "items",
+            "examples",
+        ]:
+            if nested_key in records:
+                try:
+                    return extract_record_patent_ids(
+                        records[nested_key]
+                    )
+                except Exception:
+                    pass
 
-        if isinstance(obj, pd.DataFrame):
-            labels = obj.copy()
-
-        elif isinstance(obj, pd.Series):
-            labels = obj.to_frame(name=obj.name or "label")
-
-        elif isinstance(obj, dict):
-            labels = pd.DataFrame(obj)
-
-        else:
-            values = np.asarray(obj)
-
-            if values.ndim == 1:
-                labels = pd.DataFrame({"label": values})
-            else:
-                labels = pd.DataFrame(values)
-
-    else:
-        raise ValueError(
-            f"지원하지 않는 label 형식입니다: {suffix}"
-        )
-
-    if LABEL_COLUMNS is not None:
-        missing_columns = [
-            column for column in LABEL_COLUMNS
-            if column not in labels.columns
-        ]
-
-        if missing_columns:
-            raise KeyError(
-                f"Label 파일에 다음 열이 없습니다: {missing_columns}\n"
-                f"현재 열: {list(labels.columns)}"
+    if isinstance(records, (list, tuple, np.ndarray)):
+        if len(records) == 0:
+            raise ValueError(
+                "test_records is empty."
             )
 
-        labels = labels[LABEL_COLUMNS].copy()
+        first = records[0]
 
-    return labels.reset_index(drop=True)
+        if isinstance(first, dict):
+            for key in PATENT_ID_KEYS:
+                if key in first:
+                    return normalize_patent_ids([
+                        record[key]
+                        for record in records
+                    ])
+
+        for key in PATENT_ID_KEYS:
+            if hasattr(first, key):
+                return normalize_patent_ids([
+                    getattr(record, key)
+                    for record in records
+                ])
+
+    raise TypeError(
+        "Could not extract patent_id from test_records."
+    )
 
 
-# ============================================================
-# 7. 실제 데이터 로드 및 검증
-# ============================================================
-bow_train = load_sparse_matrix(TRAIN_BOW_PATH)
-bow_test = load_sparse_matrix(TEST_BOW_PATH)
-vocab = load_vocabulary(VOCAB_PATH)
-test_labels = load_labels(TEST_LABEL_PATH)
+def reference_candidates(ref_test):
+    candidates = []
 
-print("\n=== Loaded data ===")
-print(f"Train BoW : {bow_train.shape}, nnz={bow_train.nnz:,}")
-print(f"Test BoW  : {bow_test.shape}, nnz={bow_test.nnz:,}")
-print(f"Vocabulary: {len(vocab):,}")
+    if isinstance(ref_test, dict):
+        candidate_keys = [
+            "patent_index",
+            "patent_indices",
+            "record_index",
+            "record_indices",
+            "patent_id",
+            "patent_ids",
+            "ref",
+            "references",
+            "indices",
+        ]
 
-if bow_train.shape[1] != len(vocab):
+        for key in candidate_keys:
+            if key in ref_test:
+                candidates.extend(
+                    reference_candidates(ref_test[key])
+                )
+
+        return candidates
+
+    values = np.asarray(ref_test)
+
+    if values.ndim == 1:
+        candidates.append(values)
+
+    elif values.ndim == 2:
+        for column in range(values.shape[1]):
+            candidates.append(values[:, column])
+
+    return candidates
+
+
+def resolve_claim_patent_ids(
+    ref_test,
+    record_patent_ids,
+    expected_claims,
+):
+    number_of_patents = len(record_patent_ids)
+    record_id_set = set(record_patent_ids)
+
+    # Nested list: one list per patent
+    if (
+        isinstance(ref_test, (list, tuple))
+        and len(ref_test) == number_of_patents
+        and len(ref_test) > 0
+        and isinstance(
+            ref_test[0],
+            (list, tuple, np.ndarray),
+        )
+    ):
+        lengths = np.asarray([
+            len(item) for item in ref_test
+        ])
+
+        if lengths.sum() == expected_claims:
+            return (
+                np.repeat(
+                    record_patent_ids,
+                    lengths,
+                ),
+                "nested references by patent",
+            )
+
+    candidates = reference_candidates(ref_test)
+
+    for candidate in candidates:
+        candidate = np.asarray(candidate).ravel()
+
+        if len(candidate) != expected_claims:
+            continue
+
+        # Direct patent IDs
+        direct_ids = normalize_patent_ids(candidate)
+
+        direct_overlap = np.mean([
+            patent_id in record_id_set
+            for patent_id in direct_ids
+        ])
+
+        if direct_overlap >= 0.99:
+            return direct_ids, "direct patent IDs"
+
+        # Numeric record indices
+        try:
+            indices = candidate.astype(np.int64)
+        except (ValueError, TypeError):
+            continue
+
+        if (
+            indices.min() >= 0
+            and indices.max() < number_of_patents
+        ):
+            return (
+                record_patent_ids[indices],
+                "zero-based record indices",
+            )
+
+        if (
+            indices.min() >= 1
+            and indices.max() <= number_of_patents
+        ):
+            return (
+                record_patent_ids[indices - 1],
+                "one-based record indices",
+            )
+
     raise ValueError(
-        "Train BoW와 vocabulary 크기가 다릅니다.\n"
-        f"bow_train.shape[1]={bow_train.shape[1]:,}\n"
-        f"len(vocab)={len(vocab):,}"
+        "Could not resolve claim-to-patent mapping from "
+        "ref_test.pkl."
     )
-
-if bow_test.shape[1] != len(vocab):
-    raise ValueError(
-        "Test BoW와 vocabulary 크기가 다릅니다.\n"
-        f"bow_test.shape[1]={bow_test.shape[1]:,}\n"
-        f"len(vocab)={len(vocab):,}"
-    )
-
-if test_labels is not None:
-    print(f"Test labels: {test_labels.shape}")
-    print(f"Label columns: {list(test_labels.columns)}")
-
-    if len(test_labels) != bow_test.shape[0]:
-        raise ValueError(
-            "Test label 개수와 test 문서 수가 다릅니다.\n"
-            f"labels={len(test_labels):,}\n"
-            f"test documents={bow_test.shape[0]:,}"
-        )
-else:
-    print("Test labels: not configured; CPC evaluation will be skipped.")
 
 
 # ============================================================
-# 8. 동일한 학습 샘플 준비
+# 8. CPC reference
 # ============================================================
-nonempty_train_indices = np.flatnonzero(
-    np.asarray(bow_train.getnnz(axis=1)).ravel() > 0
-)
-
-if len(nonempty_train_indices) == 0:
-    raise ValueError("Train BoW에 비어 있지 않은 문서가 없습니다.")
-
-actual_sample_size = min(
-    HDP_TRAIN_SAMPLE_SIZE,
-    len(nonempty_train_indices)
-)
-
-if SAMPLE_IDX_PATH.is_file():
-    sample_idx = np.load(SAMPLE_IDX_PATH)
-
-    valid_saved_sample = (
-        sample_idx.ndim == 1
-        and len(sample_idx) == actual_sample_size
-        and sample_idx.min(initial=0) >= 0
-        and sample_idx.max(initial=0) < bow_train.shape[0]
+def load_cpc_reference(path):
+    reference = pd.read_csv(
+        path,
+        dtype={"patent_id": str},
     )
 
-    if valid_saved_sample:
-        print(f"[LOAD] Existing sample indices: {SAMPLE_IDX_PATH}")
-    else:
-        print("[WARNING] Saved sample indices are invalid. Regenerating.")
-        sample_idx = None
-else:
-    sample_idx = None
+    required_columns = [
+        "patent_id",
+        "section",
+        "class",
+        "subclass",
+    ]
 
-if sample_idx is None:
-    sample_rng = np.random.RandomState(HDP_SAMPLE_SEED)
+    missing = [
+        column
+        for column in required_columns
+        if column not in reference.columns
+    ]
 
-    sample_idx = sample_rng.choice(
-        nonempty_train_indices,
-        size=actual_sample_size,
-        replace=False,
+    if missing:
+        raise KeyError(
+            f"Missing CPC columns: {missing}"
+        )
+
+    reference = reference[
+        required_columns
+    ].copy()
+
+    reference["patent_id"] = normalize_patent_ids(
+        reference["patent_id"]
     )
 
-    sample_idx = np.asarray(sample_idx, dtype=np.int64)
-    np.save(SAMPLE_IDX_PATH, sample_idx)
+    reference = reference.drop_duplicates(
+        subset=["patent_id"]
+    ).reset_index(drop=True)
 
-    print(f"[SAVE] Sample indices: {SAMPLE_IDX_PATH}")
-
-bow_train_sample = bow_train[sample_idx].tocsr()
-bow_train_sample.sort_indices()
-
-if np.any(np.asarray(bow_train_sample.getnnz(axis=1)).ravel() == 0):
-    raise ValueError("샘플에 빈 학습 문서가 포함되어 있습니다.")
-
-id2word = {
-    index: str(word)
-    for index, word in enumerate(vocab)
-}
-
-print("\n=== HDP configuration ===")
-print(f"Gensim version         : {gensim.__version__}")
-print(f"NumPy version          : {np.__version__}")
-print(f"SciPy version          : {scipy.__version__}")
-print(f"Train documents        : {bow_train.shape[0]:,}")
-print(f"Non-empty train docs   : {len(nonempty_train_indices):,}")
-print(f"Sampled train docs     : {len(sample_idx):,}")
-print(f"Test documents         : {bow_test.shape[0]:,}")
-print(f"Vocabulary size        : {len(vocab):,}")
-print(f"Seeds                  : {SEEDS}")
-print(f"T / K                  : {HDP_T} / {HDP_K}")
-print(f"Chunksize              : {HDP_CHUNKSIZE:,}")
-print(f"Approx. training chunks: {int(np.ceil(len(sample_idx) / HDP_CHUNKSIZE)):,}")
-print(f"Inference batch size   : {HDP_INFERENCE_BATCH_SIZE:,}")
-print("GPU usage              : Gensim HDP is CPU-based")
+    return reference
 
 
 # ============================================================
-# 9. 평가 함수
-# ============================================================
-def calculate_clustering_metrics(true_labels, predicted_topics):
-    """
-    Pur_p:
-        각 예측 토픽에서 가장 많은 실제 CPC의 비율을 합산한 purity.
-
-    Pur_a:
-        각 실제 CPC에서 가장 많은 예측 토픽의 비율을 합산한
-        inverse purity.
-
-    NMI:
-        실제 CPC와 예측 토픽 간 normalized mutual information.
-    """
-    true_labels = np.asarray(true_labels)
-    predicted_topics = np.asarray(predicted_topics)
-
-    if len(true_labels) != len(predicted_topics):
-        raise ValueError(
-            "Label과 predicted topic 길이가 다릅니다."
-        )
-
-    valid_mask = (
-        ~pd.isna(true_labels)
-        & ~pd.isna(predicted_topics)
-    )
-
-    true_labels = true_labels[valid_mask]
-    predicted_topics = predicted_topics[valid_mask]
-
-    if len(true_labels) == 0:
-        return {
-            "n_documents": 0,
-            "pur_p": np.nan,
-            "pur_a": np.nan,
-            "nmi": np.nan,
-        }
-
-    contingency = pd.crosstab(
-        pd.Series(predicted_topics, name="predicted_topic"),
-        pd.Series(true_labels, name="actual_label"),
-        dropna=False,
-    )
-
-    total = contingency.to_numpy().sum()
-
-    pur_p = (
-        contingency.max(axis=1).sum() / total
-        if contingency.shape[0] > 0
-        else np.nan
-    )
-
-    pur_a = (
-        contingency.max(axis=0).sum() / total
-        if contingency.shape[1] > 0
-        else np.nan
-    )
-
-    nmi = normalized_mutual_info_score(
-        true_labels.astype(str),
-        predicted_topics.astype(str),
-    )
-
-    return {
-        "n_documents": int(total),
-        "pur_p": float(pur_p),
-        "pur_a": float(pur_a),
-        "nmi": float(nmi),
-    }
-
-
-def evaluate_theta(seed, theta, labels_df):
-    if labels_df is None:
-        return []
-
-    nonempty_theta = theta.sum(axis=1) > 0
-    predicted_topics = np.full(
-        theta.shape[0],
-        fill_value=-1,
-        dtype=np.int32,
-    )
-
-    predicted_topics[nonempty_theta] = theta[
-        nonempty_theta
-    ].argmax(axis=1)
-
-    results = []
-
-    for label_column in labels_df.columns:
-        valid = (
-            nonempty_theta
-            & labels_df[label_column].notna().to_numpy()
-        )
-
-        metrics = calculate_clustering_metrics(
-            labels_df.loc[valid, label_column].to_numpy(),
-            predicted_topics[valid],
-        )
-
-        result = {
-            "model": "HDP",
-            "seed": int(seed),
-            "label_level": str(label_column),
-            "n_documents": metrics["n_documents"],
-            "pur_p": metrics["pur_p"],
-            "pur_a": metrics["pur_a"],
-            "nmi": metrics["nmi"],
-        }
-
-        results.append(result)
-
-        print(
-            f"  [{label_column}] "
-            f"Pur_p={metrics['pur_p']:.4f} | "
-            f"Pur_a={metrics['pur_a']:.4f} | "
-            f"NMI={metrics['nmi']:.4f} | "
-            f"N={metrics['n_documents']:,}"
-        )
-
-    return results
-
-
-# ============================================================
-# 10. HDP theta 배치 추론
+# 9. HDP inference
 # ============================================================
 def infer_hdp_theta(
-    hdp,
+    model,
     bow_matrix,
-    batch_size=HDP_INFERENCE_BATCH_SIZE,
+    batch_size,
 ):
-    """
-    hdp[doc]의 기본 eps=0.01 확률 절단을 피하고,
-    hdp.inference()를 배치 단위로 호출합니다.
-
-    반환:
-        theta: test_documents × T, float32
-    """
-    n_documents = bow_matrix.shape[0]
-    n_topics = int(hdp.m_T)
+    number_of_documents = bow_matrix.shape[0]
+    number_of_topics = int(model.m_T)
 
     theta = np.zeros(
-        (n_documents, n_topics),
+        (number_of_documents, number_of_topics),
         dtype=np.float32,
     )
 
     progress = tqdm(
-        range(0, n_documents, batch_size),
+        range(0, number_of_documents, batch_size),
         desc="HDP test inference",
     )
 
     for start in progress:
-        end = min(start + batch_size, n_documents)
+        end = min(
+            start + batch_size,
+            number_of_documents,
+        )
 
-        batch_matrix = bow_matrix[start:end].tocsr()
+        batch_matrix = bow_matrix[
+            start:end
+        ].tocsr()
+
         batch_nnz = np.asarray(
             batch_matrix.getnnz(axis=1)
         ).ravel()
 
-        local_nonempty_indices = np.flatnonzero(batch_nnz > 0)
+        nonempty_indices = np.flatnonzero(
+            batch_nnz > 0
+        )
 
-        if len(local_nonempty_indices) == 0:
+        if len(nonempty_indices) == 0:
             continue
 
         nonempty_matrix = batch_matrix[
-            local_nonempty_indices
+            nonempty_indices
         ].tocsr()
 
         batch_corpus = Sparse2Corpus(
@@ -840,29 +690,32 @@ def infer_hdp_theta(
             documents_columns=False,
         )
 
-        batch_documents = list(batch_corpus)
+        gamma = model.inference(
+            list(batch_corpus)
+        )
 
-        gamma = hdp.inference(batch_documents)
-        gamma = np.asarray(gamma, dtype=np.float64)
+        gamma = np.asarray(
+            gamma,
+            dtype=np.float64,
+        )
 
-        if gamma.ndim != 2:
+        if gamma.shape != (
+            len(nonempty_indices),
+            number_of_topics,
+        ):
             raise ValueError(
-                f"예상하지 못한 gamma shape: {gamma.shape}"
-            )
-
-        if gamma.shape[1] != n_topics:
-            raise ValueError(
-                f"Gamma topic dimension mismatch: "
-                f"gamma={gamma.shape}, expected T={n_topics}"
+                f"Unexpected gamma shape: {gamma.shape}"
             )
 
         if not np.isfinite(gamma).all():
             raise FloatingPointError(
-                f"추론 gamma에 NaN/Inf가 있습니다: "
-                f"documents {start}:{end}"
+                f"Non-finite gamma: {start}:{end}"
             )
 
-        row_sums = gamma.sum(axis=1, keepdims=True)
+        row_sums = gamma.sum(
+            axis=1,
+            keepdims=True,
+        )
 
         normalized_gamma = np.divide(
             gamma,
@@ -871,408 +724,914 @@ def infer_hdp_theta(
             where=row_sums > 0,
         )
 
-        global_indices = start + local_nonempty_indices
-
-        theta[global_indices] = normalized_gamma.astype(
-            np.float32
-        )
+        theta[
+            start + nonempty_indices
+        ] = normalized_gamma.astype(np.float32)
 
         progress.set_postfix(
-            processed=f"{end:,}/{n_documents:,}",
+            processed=f"{end:,}/{number_of_documents:,}",
             refresh=False,
         )
 
     if not np.isfinite(theta).all():
         raise FloatingPointError(
-            "최종 theta에 NaN 또는 Inf가 있습니다."
+            "Final theta contains NaN/Inf."
         )
 
-    valid_rows = theta.sum(axis=1) > 0
+    valid = theta.sum(axis=1) > 0
 
-    if np.any(valid_rows):
-        row_sums = theta[valid_rows].sum(axis=1)
+    if np.any(valid):
+        row_sums = theta[valid].sum(axis=1)
 
-        if not np.allclose(row_sums, 1.0, atol=1e-5):
-            max_error = float(
-                np.max(np.abs(row_sums - 1.0))
-            )
-
+        if not np.allclose(
+            row_sums,
+            1.0,
+            atol=1e-5,
+        ):
             raise ValueError(
-                f"Theta 행 합 정규화 오류: max error={max_error}"
+                "Theta rows are not normalized."
             )
 
     return theta
 
 
 # ============================================================
-# 11. Seed별 HDP 학습 함수
+# 10. Claim theta -> Patent theta
 # ============================================================
-def train_or_load_hdp(seed):
-    model_path = MODEL_DIR / (
-        f"hdp_seed{seed}"
-        f"_sample{len(sample_idx)}"
-        f"_T{HDP_T}_K{HDP_K}.model"
+def aggregate_claim_theta_to_patent(
+    claim_theta,
+    claim_patent_ids,
+):
+    valid_claims = np.asarray(
+        claim_theta.sum(axis=1) > 0
     )
 
-    if REUSE_EXISTING_MODEL and model_path.is_file():
-        print(f"[LOAD] Existing HDP model: {model_path}")
+    valid_ids = claim_patent_ids[valid_claims]
 
-        hdp = HdpModel.load(str(model_path))
-
-        if int(hdp.m_T) != int(HDP_T):
-            raise ValueError(
-                f"저장 모델 T={hdp.m_T}, 현재 T={HDP_T}"
-            )
-
-        return hdp, model_path, 0.0, True
-
-    print(f"[TRAIN] HDP seed={seed}")
-
-    # seed마다 corpus iterable을 새로 생성
-    train_corpus = Sparse2Corpus(
-        bow_train_sample,
-        documents_columns=False,
+    valid_theta = np.asarray(
+        claim_theta[valid_claims],
+        dtype=np.float64,
     )
 
-    start_time = time.time()
-
-    hdp = HdpModel(
-        corpus=train_corpus,
-        id2word=id2word,
-        random_state=seed,
-        T=HDP_T,
-        K=HDP_K,
-        chunksize=HDP_CHUNKSIZE,
-        kappa=HDP_KAPPA,
-        tau=HDP_TAU,
-        alpha=HDP_ALPHA,
-        gamma=HDP_GAMMA,
-        eta=HDP_ETA,
+    patent_ids, inverse_indices = np.unique(
+        valid_ids,
+        return_inverse=True,
     )
 
-    training_seconds = time.time() - start_time
-
-    print(
-        f"[DONE] seed={seed} training time: "
-        f"{training_seconds / 60:.2f} minutes"
+    patent_theta_sum = np.zeros(
+        (
+            len(patent_ids),
+            claim_theta.shape[1],
+        ),
+        dtype=np.float64,
     )
 
-    if SAVE_HDP_MODEL:
-        hdp.save(str(model_path))
-        print(f"[SAVE] HDP model: {model_path}")
-
-    return hdp, model_path, training_seconds, False
-
-
-# ============================================================
-# 12. Seed별 학습·추론·평가
-# ============================================================
-all_metric_rows = []
-run_records = []
-successful_seeds = []
-failed_seeds = []
-
-for seed in SEEDS:
-    print("\n" + "=" * 70)
-    print(f"HDP SEED {seed}")
-    print("=" * 70)
-
-    # 재현성 보조 설정
-    random.seed(seed)
-    np.random.seed(seed)
-
-    theta_path = THETA_DIR / (
-        f"hdp_theta_test_seed{seed}"
-        f"_sample{len(sample_idx)}"
-        f"_T{HDP_T}_K{HDP_K}.npy"
+    patent_claim_counts = np.zeros(
+        len(patent_ids),
+        dtype=np.int64,
     )
 
-    try:
-        hdp, model_path, training_seconds, reused_model = (
-            train_or_load_hdp(seed)
+    np.add.at(
+        patent_theta_sum,
+        inverse_indices,
+        valid_theta,
+    )
+
+    np.add.at(
+        patent_claim_counts,
+        inverse_indices,
+        1,
+    )
+
+    patent_theta = patent_theta_sum / np.maximum(
+        patent_claim_counts[:, None],
+        1,
+    )
+
+    row_sums = patent_theta.sum(
+        axis=1,
+        keepdims=True,
+    )
+
+    patent_theta = np.divide(
+        patent_theta,
+        row_sums,
+        out=np.zeros_like(patent_theta),
+        where=row_sums > 0,
+    )
+
+    if not np.isfinite(patent_theta).all():
+        raise FloatingPointError(
+            "Patent theta contains NaN/Inf."
         )
 
-        if theta_path.is_file() and not FORCE_REINFERENCE:
-            print(f"[LOAD] Existing theta: {theta_path}")
-            theta_test = np.load(
-                theta_path,
-                mmap_mode=None,
-            )
-
-            inference_seconds = 0.0
-            reused_theta = True
-
-        else:
-            print(f"[INFERENCE] HDP seed={seed}")
-
-            inference_start = time.time()
-
-            theta_test = infer_hdp_theta(
-                hdp,
-                bow_test,
-                batch_size=HDP_INFERENCE_BATCH_SIZE,
-            )
-
-            inference_seconds = time.time() - inference_start
-            reused_theta = False
-
-            np.save(theta_path, theta_test)
-
-            print(f"[SAVE] Test theta: {theta_path}")
-            print(
-                f"[DONE] Inference time: "
-                f"{inference_seconds / 60:.2f} minutes"
-            )
-
-        expected_shape = (
-            bow_test.shape[0],
-            int(hdp.m_T),
-        )
-
-        if theta_test.shape != expected_shape:
-            raise ValueError(
-                f"Theta shape mismatch: "
-                f"actual={theta_test.shape}, "
-                f"expected={expected_shape}"
-            )
-
-        valid_documents = theta_test.sum(axis=1) > 0
-        empty_documents = int((~valid_documents).sum())
-
-        if np.any(valid_documents):
-            assigned_topics = theta_test[
-                valid_documents
-            ].argmax(axis=1)
-
-            effective_topics = int(
-                np.unique(assigned_topics).size
-            )
-        else:
-            effective_topics = 0
-
-        print("\n=== Seed result ===")
-        print(f"Seed                     : {seed}")
-        print(f"Theta shape              : {theta_test.shape}")
-        print(f"Truncation dimension T   : {hdp.m_T}")
-        print(f"Effective assigned topics: {effective_topics}")
-        print(f"Empty test documents     : {empty_documents:,}")
-
-        seed_metrics = evaluate_theta(
-            seed=seed,
-            theta=theta_test,
-            labels_df=test_labels,
-        )
-
-        all_metric_rows.extend(seed_metrics)
-        successful_seeds.append(seed)
-
-        run_records.append({
-            "seed": int(seed),
-            "status": "success",
-            "model_path": str(model_path),
-            "theta_path": str(theta_path),
-            "theta_shape": list(theta_test.shape),
-            "truncation_T": int(hdp.m_T),
-            "effective_assigned_topics": effective_topics,
-            "empty_test_documents": empty_documents,
-            "training_seconds": float(training_seconds),
-            "inference_seconds": float(inference_seconds),
-            "reused_model": bool(reused_model),
-            "reused_theta": bool(reused_theta),
-        })
-
-        del theta_test
-        del hdp
-        gc.collect()
-
-    except Exception as error:
-        failed_seeds.append(seed)
-
-        error_traceback = traceback.format_exc()
-
-        print(f"\n[FAILED] HDP seed={seed}")
-        print(f"Error: {error}")
-        print(error_traceback)
-
-        run_records.append({
-            "seed": int(seed),
-            "status": "failed",
-            "error": str(error),
-            "traceback": error_traceback,
-        })
-
-        gc.collect()
-
-
-# ============================================================
-# 13. 평가 결과 저장 및 평균±표준편차 계산
-# ============================================================
-metric_summary_rows = []
-
-if all_metric_rows:
-    metrics_df = pd.DataFrame(all_metric_rows)
-
-    metrics_df.to_csv(
-        METRICS_CSV_PATH,
-        index=False,
-        encoding="utf-8-sig",
+    return (
+        normalize_patent_ids(patent_ids),
+        patent_theta,
+        patent_claim_counts,
     )
 
-    print(f"\n[SAVE] Per-seed metrics: {METRICS_CSV_PATH}")
 
-    for label_level, group in metrics_df.groupby("label_level"):
-        summary_row = {
-            "model": "HDP",
-            "label_level": label_level,
-            "successful_seed_count": int(group["seed"].nunique()),
-            "pur_p_mean": float(group["pur_p"].mean()),
-            "pur_p_std": float(group["pur_p"].std(ddof=1))
-                if len(group) > 1 else 0.0,
-            "pur_a_mean": float(group["pur_a"].mean()),
-            "pur_a_std": float(group["pur_a"].std(ddof=1))
-                if len(group) > 1 else 0.0,
-            "nmi_mean": float(group["nmi"].mean()),
-            "nmi_std": float(group["nmi"].std(ddof=1))
-                if len(group) > 1 else 0.0,
+# ============================================================
+# 11. Evaluation
+# ============================================================
+def clustering_metrics(
+    true_labels,
+    predicted_topics,
+):
+    true_labels = np.asarray(true_labels)
+    predicted_topics = np.asarray(predicted_topics)
+
+    valid = (
+        ~pd.isna(true_labels)
+        & ~pd.isna(predicted_topics)
+    )
+
+    true_labels = true_labels[valid].astype(str)
+    predicted_topics = predicted_topics[valid]
+
+    if len(true_labels) == 0:
+        return {
+            "n_documents": 0,
+            "Pur_p": np.nan,
+            "Pur_a": np.nan,
+            "NMI": np.nan,
         }
 
-        metric_summary_rows.append(summary_row)
-
-    metric_summary_df = pd.DataFrame(metric_summary_rows)
-
-    metric_summary_path = RESULT_DIR / (
-        f"{RUN_NAME}_metric_mean_std.csv"
+    contingency = pd.crosstab(
+        pd.Series(
+            predicted_topics,
+            name="predicted_topic",
+        ),
+        pd.Series(
+            true_labels,
+            name="actual_label",
+        ),
+        dropna=False,
     )
 
-    metric_summary_df.to_csv(
-        metric_summary_path,
+    total = contingency.to_numpy().sum()
+
+    pur_p = (
+        contingency.max(axis=1).sum()
+        / total
+    )
+
+    pur_a = (
+        contingency.max(axis=0).sum()
+        / total
+    )
+
+    nmi = normalized_mutual_info_score(
+        true_labels,
+        predicted_topics.astype(str),
+    )
+
+    return {
+        "n_documents": int(total),
+        "Pur_p": float(pur_p),
+        "Pur_a": float(pur_a),
+        "NMI": float(nmi),
+    }
+
+
+# ============================================================
+# 12. Top words
+# ============================================================
+def save_top_words(model, seed):
+    output_path = (
+        TOPIC_DIR
+        / f"hdp_top_words_seed{seed}.json"
+    )
+
+    topics = []
+
+    for topic_id in range(int(model.m_T)):
+        topic_words = model.show_topic(
+            topic_id,
+            topn=TOP_WORDS,
+        )
+
+        topics.append({
+            "topic_id": int(topic_id),
+            "words": [
+                {
+                    "word": str(word),
+                    "weight": float(weight),
+                }
+                for word, weight in topic_words
+            ],
+        })
+
+    atomic_save_json(
+        topics,
+        output_path,
+    )
+
+    return output_path
+
+
+# ============================================================
+# 13. Main
+# ============================================================
+def main():
+    validate_required_files()
+
+    print("\n=== Loading data ===")
+
+    bow_train = load_sparse_matrix(
+        TRAIN_BOW_PATH
+    )
+
+    bow_test = load_sparse_matrix(
+        TEST_BOW_PATH
+    )
+
+    vocabulary = load_vocabulary(
+        VOCAB_PATH
+    )
+
+    if bow_train.shape[1] != len(vocabulary):
+        raise ValueError(
+            "Train BoW/vocabulary mismatch."
+        )
+
+    if bow_test.shape[1] != len(vocabulary):
+        raise ValueError(
+            "Test BoW/vocabulary mismatch."
+        )
+
+    with open(TEST_RECORDS_PATH, "rb") as file:
+        test_records = pickle.load(file)
+
+    with open(REF_TEST_PATH, "rb") as file:
+        ref_test = pickle.load(file)
+
+    record_patent_ids = extract_record_patent_ids(
+        test_records
+    )
+
+    claim_patent_ids, reference_type = (
+        resolve_claim_patent_ids(
+            ref_test=ref_test,
+            record_patent_ids=record_patent_ids,
+            expected_claims=bow_test.shape[0],
+        )
+    )
+
+    if len(claim_patent_ids) != bow_test.shape[0]:
+        raise ValueError(
+            "Claim-patent mapping length mismatch."
+        )
+
+    cpc_reference = load_cpc_reference(
+        CPC_REFERENCE_PATH
+    )
+
+    print("\n=== Data ===")
+    print(f"Train BoW       : {bow_train.shape}")
+    print(f"Test BoW        : {bow_test.shape}")
+    print(f"Vocabulary      : {len(vocabulary):,}")
+    print(f"Patent records  : {len(record_patent_ids):,}")
+    print(f"Claim references: {len(claim_patent_ids):,}")
+    print(f"Unique patents  : {len(np.unique(claim_patent_ids)):,}")
+    print(f"Reference type  : {reference_type}")
+    print(f"CPC references  : {len(cpc_reference):,}")
+
+    # --------------------------------------------------------
+    # Fixed training sample
+    # --------------------------------------------------------
+    nonempty_train_indices = np.flatnonzero(
+        np.asarray(
+            bow_train.getnnz(axis=1)
+        ).ravel() > 0
+    )
+
+    sample_size = min(
+        HDP_TRAIN_SAMPLE_SIZE,
+        len(nonempty_train_indices),
+    )
+
+    if SAMPLE_IDX_PATH.is_file():
+        sample_indices = np.load(
+            SAMPLE_IDX_PATH
+        )
+
+        valid_sample = (
+            sample_indices.ndim == 1
+            and len(sample_indices) == sample_size
+            and sample_indices.min() >= 0
+            and sample_indices.max() < bow_train.shape[0]
+        )
+
+        if not valid_sample:
+            raise ValueError(
+                f"Invalid saved sample: {SAMPLE_IDX_PATH}"
+            )
+
+        print(
+            f"[LOAD] Training sample: {SAMPLE_IDX_PATH}"
+        )
+
+    else:
+        sample_rng = np.random.RandomState(
+            HDP_SAMPLE_SEED
+        )
+
+        sample_indices = sample_rng.choice(
+            nonempty_train_indices,
+            size=sample_size,
+            replace=False,
+        ).astype(np.int64)
+
+        atomic_save_npy(
+            sample_indices,
+            SAMPLE_IDX_PATH,
+        )
+
+        print(
+            f"[SAVE] Training sample: {SAMPLE_IDX_PATH}"
+        )
+
+    bow_train_sample = bow_train[
+        sample_indices
+    ].tocsr()
+
+    id2word = {
+        index: str(word)
+        for index, word in enumerate(vocabulary)
+    }
+
+    print("\n=== HDP configuration ===")
+    print(f"Seeds            : {SEEDS}")
+    print(f"Training sample  : {sample_size:,}")
+    print(f"T / K            : {HDP_T} / {HDP_K}")
+    print(f"Chunksize        : {HDP_CHUNKSIZE:,}")
+    print(f"Inference batch  : {HDP_INFERENCE_BATCH_SIZE:,}")
+    print("Device           : CPU")
+
+    metric_rows = []
+    run_records = []
+    prediction_table = None
+    successful_seeds = []
+    failed_seeds = []
+
+    for seed in SEEDS:
+        print("\n" + "=" * 70)
+        print(f"HDP SEED {seed}")
+        print("=" * 70)
+
+        random.seed(seed)
+        np.random.seed(seed)
+
+        model_path = MODEL_DIR / (
+            f"hdp_seed{seed}"
+            f"_sample{sample_size}"
+            f"_T{HDP_T}_K{HDP_K}.model"
+        )
+
+        theta_path = THETA_DIR / (
+            f"hdp_theta_test_seed{seed}"
+            f"_sample{sample_size}"
+            f"_T{HDP_T}_K{HDP_K}.npy"
+        )
+
+        try:
+            # ------------------------------------------------
+            # Train/load model
+            # ------------------------------------------------
+            if (
+                REUSE_EXISTING_MODEL
+                and model_path.is_file()
+            ):
+                print(
+                    f"[LOAD] HDP model: {model_path}"
+                )
+
+                model = HdpModel.load(
+                    str(model_path)
+                )
+
+                training_seconds = 0.0
+                reused_model = True
+
+            else:
+                print(f"[TRAIN] HDP seed={seed}")
+
+                train_corpus = Sparse2Corpus(
+                    bow_train_sample,
+                    documents_columns=False,
+                )
+
+                training_start = time.time()
+
+                model = HdpModel(
+                    corpus=train_corpus,
+                    id2word=id2word,
+                    random_state=seed,
+                    T=HDP_T,
+                    K=HDP_K,
+                    chunksize=HDP_CHUNKSIZE,
+                    kappa=HDP_KAPPA,
+                    tau=HDP_TAU,
+                    alpha=HDP_ALPHA,
+                    gamma=HDP_GAMMA,
+                    eta=HDP_ETA,
+                )
+
+                training_seconds = (
+                    time.time() - training_start
+                )
+
+                reused_model = False
+
+                if SAVE_MODEL:
+                    model.save(str(model_path))
+
+                print(
+                    f"[DONE] Training: "
+                    f"{training_seconds / 60:.2f} min"
+                )
+
+            if int(model.m_T) != HDP_T:
+                raise ValueError(
+                    f"Model T={model.m_T}, expected={HDP_T}"
+                )
+
+            # ------------------------------------------------
+            # Infer/load theta
+            # ------------------------------------------------
+            if (
+                REUSE_EXISTING_THETA
+                and theta_path.is_file()
+            ):
+                print(
+                    f"[LOAD] Claim theta: {theta_path}"
+                )
+
+                claim_theta = np.load(
+                    theta_path,
+                    mmap_mode="r",
+                )
+
+                inference_seconds = 0.0
+                reused_theta = True
+
+            else:
+                print(
+                    f"[INFERENCE] HDP seed={seed}"
+                )
+
+                inference_start = time.time()
+
+                claim_theta = infer_hdp_theta(
+                    model=model,
+                    bow_matrix=bow_test,
+                    batch_size=HDP_INFERENCE_BATCH_SIZE,
+                )
+
+                inference_seconds = (
+                    time.time() - inference_start
+                )
+
+                atomic_save_npy(
+                    claim_theta,
+                    theta_path,
+                )
+
+                reused_theta = False
+
+                print(
+                    f"[DONE] Inference: "
+                    f"{inference_seconds / 60:.2f} min"
+                )
+
+            expected_shape = (
+                bow_test.shape[0],
+                HDP_T,
+            )
+
+            if claim_theta.shape != expected_shape:
+                raise ValueError(
+                    f"Theta shape={claim_theta.shape}, "
+                    f"expected={expected_shape}"
+                )
+
+            # ------------------------------------------------
+            # Claim -> patent aggregation
+            # ------------------------------------------------
+            (
+                patent_ids,
+                patent_theta,
+                patent_claim_counts,
+            ) = aggregate_claim_theta_to_patent(
+                claim_theta=claim_theta,
+                claim_patent_ids=claim_patent_ids,
+            )
+
+            predicted_topics = patent_theta.argmax(
+                axis=1
+            ).astype(np.int32)
+
+            predicted_probabilities = patent_theta.max(
+                axis=1
+            )
+
+            seed_predictions = pd.DataFrame({
+                "patent_id": patent_ids,
+                "num_claims": patent_claim_counts,
+                f"dominant_topic_seed{seed}":
+                    predicted_topics,
+                f"dominant_probability_seed{seed}":
+                    predicted_probabilities,
+            })
+
+            evaluation_data = cpc_reference.merge(
+                seed_predictions,
+                on="patent_id",
+                how="inner",
+                validate="one_to_one",
+            )
+
+            if len(evaluation_data) == 0:
+                raise ValueError(
+                    "No patent IDs matched CPC reference."
+                )
+
+            match_ratio = (
+                len(evaluation_data)
+                / len(seed_predictions)
+            )
+
+            if match_ratio < 0.95:
+                raise ValueError(
+                    f"Low CPC matching ratio: "
+                    f"{match_ratio:.2%}"
+                )
+
+            topic_column = (
+                f"dominant_topic_seed{seed}"
+            )
+
+            metric_row = {
+                "seed": int(seed),
+                "num_claims": int(
+                    patent_claim_counts.sum()
+                ),
+                "num_patents": int(
+                    len(evaluation_data)
+                ),
+                "active_topics": int(
+                    evaluation_data[
+                        topic_column
+                    ].nunique()
+                ),
+                "mean_claims_per_patent": float(
+                    evaluation_data[
+                        "num_claims"
+                    ].mean()
+                ),
+            }
+
+            print("\n=== CPC evaluation ===")
+
+            for level in [
+                "section",
+                "class",
+                "subclass",
+            ]:
+                valid = evaluation_data[
+                    level
+                ].notna()
+
+                result = clustering_metrics(
+                    true_labels=evaluation_data.loc[
+                        valid,
+                        level,
+                    ].to_numpy(),
+                    predicted_topics=evaluation_data.loc[
+                        valid,
+                        topic_column,
+                    ].to_numpy(),
+                )
+
+                metric_row[
+                    f"{level}_Pur_p"
+                ] = result["Pur_p"]
+
+                metric_row[
+                    f"{level}_Pur_a"
+                ] = result["Pur_a"]
+
+                metric_row[
+                    f"{level}_NMI"
+                ] = result["NMI"]
+
+                print(
+                    f"{level:8s} | "
+                    f"Pur_p={result['Pur_p']:.4f} | "
+                    f"Pur_a={result['Pur_a']:.4f} | "
+                    f"NMI={result['NMI']:.4f}"
+                )
+
+            metric_rows.append(metric_row)
+
+            # ------------------------------------------------
+            # Predictions
+            # ------------------------------------------------
+            current_predictions = evaluation_data[[
+                "patent_id",
+                "section",
+                "class",
+                "subclass",
+                "num_claims",
+                topic_column,
+                f"dominant_probability_seed{seed}",
+            ]].copy()
+
+            if prediction_table is None:
+                prediction_table = current_predictions
+
+            else:
+                prediction_table = prediction_table.merge(
+                    current_predictions[[
+                        "patent_id",
+                        topic_column,
+                        f"dominant_probability_seed{seed}",
+                    ]],
+                    on="patent_id",
+                    how="inner",
+                    validate="one_to_one",
+                )
+
+            top_words_path = save_top_words(
+                model=model,
+                seed=seed,
+            )
+
+            run_records.append({
+                "seed": int(seed),
+                "status": "success",
+                "training_seconds": float(
+                    training_seconds
+                ),
+                "inference_seconds": float(
+                    inference_seconds
+                ),
+                "reused_model": bool(reused_model),
+                "reused_theta": bool(reused_theta),
+                "model_path": str(model_path),
+                "theta_path": str(theta_path),
+                "top_words_path": str(
+                    top_words_path
+                ),
+                "claim_theta_shape": list(
+                    claim_theta.shape
+                ),
+                "evaluated_patents": int(
+                    len(evaluation_data)
+                ),
+                "active_topics": int(
+                    metric_row["active_topics"]
+                ),
+            })
+
+            successful_seeds.append(seed)
+
+            del model
+            del claim_theta
+            del patent_theta
+            del evaluation_data
+            gc.collect()
+
+        except Exception as error:
+            failed_seeds.append(seed)
+
+            error_traceback = traceback.format_exc()
+
+            print(
+                f"\n[FAILED] seed={seed}: {error}"
+            )
+            print(error_traceback)
+
+            run_records.append({
+                "seed": int(seed),
+                "status": "failed",
+                "error": str(error),
+                "traceback": error_traceback,
+            })
+
+            with open(
+                ERROR_LOG_PATH,
+                "a",
+                encoding="utf-8",
+            ) as file:
+                file.write(
+                    f"\nseed={seed}: {error}\n"
+                )
+                file.write(error_traceback)
+                file.write("\n")
+
+            gc.collect()
+
+    # --------------------------------------------------------
+    # Save per-seed metrics
+    # --------------------------------------------------------
+    if not metric_rows:
+        raise RuntimeError(
+            "No HDP seed was evaluated successfully."
+        )
+
+    metrics_df = pd.DataFrame(metric_rows)
+
+    metrics_df.to_csv(
+        METRICS_PATH,
         index=False,
         encoding="utf-8-sig",
     )
 
-    print(f"[SAVE] Metric mean/std: {metric_summary_path}")
-
-    print("\n=== HDP metric summary: mean ± std ===")
-
-    for row in metric_summary_rows:
-        print(
-            f"[{row['label_level']}] "
-            f"Pur_p={row['pur_p_mean']:.4f}"
-            f"±{row['pur_p_std']:.4f} | "
-            f"Pur_a={row['pur_a_mean']:.4f}"
-            f"±{row['pur_a_std']:.4f} | "
-            f"NMI={row['nmi_mean']:.4f}"
-            f"±{row['nmi_std']:.4f}"
+    if prediction_table is not None:
+        prediction_table.to_csv(
+            PREDICTIONS_PATH,
+            index=False,
+            encoding="utf-8-sig",
         )
 
-else:
-    print(
-        "\n[INFO] Test label 경로가 설정되지 않았거나 "
-        "평가 결과가 없어 metric CSV를 생성하지 않았습니다."
+    # --------------------------------------------------------
+    # Mean ± standard deviation
+    # --------------------------------------------------------
+    summary_rows = []
+
+    for level in [
+        "section",
+        "class",
+        "subclass",
+    ]:
+        summary_row = {
+            "model": "HDP",
+            "level": level,
+            "successful_seeds": len(
+                successful_seeds
+            ),
+        }
+
+        for metric in [
+            "Pur_p",
+            "Pur_a",
+            "NMI",
+        ]:
+            column = f"{level}_{metric}"
+
+            summary_row[
+                f"{metric}_mean"
+            ] = float(metrics_df[column].mean())
+
+            summary_row[
+                f"{metric}_std"
+            ] = (
+                float(
+                    metrics_df[column].std(ddof=1)
+                )
+                if len(metrics_df) > 1
+                else 0.0
+            )
+
+        summary_rows.append(summary_row)
+
+    summary_df = pd.DataFrame(summary_rows)
+
+    summary_df.to_csv(
+        METRIC_SUMMARY_CSV_PATH,
+        index=False,
+        encoding="utf-8-sig",
     )
 
-
-# ============================================================
-# 14. 전체 실행 요약 저장
-# ============================================================
-final_summary = {
-    "run_name": RUN_NAME,
-    "created_at": datetime.now().isoformat(),
-    "project_root": str(PROJECT_ROOT),
-    "data": {
-        "train_bow_path": str(TRAIN_BOW_PATH),
-        "test_bow_path": str(TEST_BOW_PATH),
-        "vocab_path": str(VOCAB_PATH),
-        "test_label_path": (
-            str(TEST_LABEL_PATH)
-            if TEST_LABEL_PATH is not None
-            else None
+    final_summary = {
+        "model": "HDP",
+        "created_at": datetime.now().isoformat(),
+        "configuration": {
+            "training_sample_size": int(
+                sample_size
+            ),
+            "sample_seed": int(
+                HDP_SAMPLE_SEED
+            ),
+            "seeds": [
+                int(seed) for seed in SEEDS
+            ],
+            "T": int(HDP_T),
+            "K": int(HDP_K),
+            "chunksize": int(
+                HDP_CHUNKSIZE
+            ),
+            "kappa": float(
+                HDP_KAPPA
+            ),
+            "tau": float(
+                HDP_TAU
+            ),
+            "alpha": float(
+                HDP_ALPHA
+            ),
+            "gamma": float(
+                HDP_GAMMA
+            ),
+            "eta": float(
+                HDP_ETA
+            ),
+            "aggregation": (
+                "mean claim theta per patent"
+            ),
+            "theta_ensemble": False,
+        },
+        "data": {
+            "train_bow_path": str(
+                TRAIN_BOW_PATH
+            ),
+            "test_bow_path": str(
+                TEST_BOW_PATH
+            ),
+            "test_records_path": str(
+                TEST_RECORDS_PATH
+            ),
+            "ref_test_path": str(
+                REF_TEST_PATH
+            ),
+            "cpc_reference_path": str(
+                CPC_REFERENCE_PATH
+            ),
+            "train_shape": list(
+                bow_train.shape
+            ),
+            "test_shape": list(
+                bow_test.shape
+            ),
+            "patent_records": int(
+                len(record_patent_ids)
+            ),
+            "reference_type": reference_type,
+        },
+        "successful_seeds": [
+            int(seed)
+            for seed in successful_seeds
+        ],
+        "failed_seeds": [
+            int(seed)
+            for seed in failed_seeds
+        ],
+        "per_seed_metrics": metric_rows,
+        "mean_std": summary_rows,
+        "runs": run_records,
+        "environment": {
+            "python": sys.version,
+            "gensim": gensim.__version__,
+            "numpy": np.__version__,
+            "scipy": scipy.__version__,
+        },
+        "note": (
+            "Models were evaluated independently per seed. "
+            "Theta matrices were not averaged because topic "
+            "indices are not aligned across independent runs."
         ),
-        "train_shape": list(bow_train.shape),
-        "test_shape": list(bow_test.shape),
-        "vocabulary_size": int(len(vocab)),
-        "sample_size": int(len(sample_idx)),
-        "sample_seed": int(HDP_SAMPLE_SEED),
-        "sample_index_path": str(SAMPLE_IDX_PATH),
-    },
-    "hdp_config": {
-        "seeds": [int(seed) for seed in SEEDS],
-        "T": int(HDP_T),
-        "K": int(HDP_K),
-        "chunksize": int(HDP_CHUNKSIZE),
-        "kappa": float(HDP_KAPPA),
-        "tau": float(HDP_TAU),
-        "alpha": float(HDP_ALPHA),
-        "gamma": float(HDP_GAMMA),
-        "eta": float(HDP_ETA),
-        "inference_batch_size": int(
-            HDP_INFERENCE_BATCH_SIZE
-        ),
-    },
-    "successful_seeds": [
-        int(seed) for seed in successful_seeds
-    ],
-    "failed_seeds": [
-        int(seed) for seed in failed_seeds
-    ],
-    "runs": run_records,
-    "metric_summary": metric_summary_rows,
-    "important_note": (
-        "Seed별 topic index는 의미적으로 정렬되어 있지 않으므로 "
-        "theta를 직접 평균하지 않았습니다. "
-        "대신 seed별 평가 지표의 평균과 표준편차를 계산했습니다."
-    ),
-}
+    }
 
-with open(
-    SUMMARY_JSON_PATH,
-    "w",
-    encoding="utf-8",
-) as file:
-    json.dump(
+    atomic_save_json(
         final_summary,
-        file,
-        ensure_ascii=False,
-        indent=2,
+        SUMMARY_JSON_PATH,
     )
 
-with open(
-    RUN_LOG_PATH,
-    "w",
-    encoding="utf-8",
-) as file:
-    json.dump(
-        final_summary,
-        file,
-        ensure_ascii=False,
-        indent=2,
-    )
+    # --------------------------------------------------------
+    # Final output
+    # --------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("HDP BASELINE: MEAN ± STD")
+    print("=" * 70)
+
+    for row in summary_rows:
+        print(
+            f"[{row['level']}] "
+            f"Pur_p={row['Pur_p_mean']:.4f}"
+            f"±{row['Pur_p_std']:.4f} | "
+            f"Pur_a={row['Pur_a_mean']:.4f}"
+            f"±{row['Pur_a_std']:.4f} | "
+            f"NMI={row['NMI_mean']:.4f}"
+            f"±{row['NMI_std']:.4f}"
+        )
+
+    print("\nSuccessful seeds:", successful_seeds)
+    print("Failed seeds    :", failed_seeds)
+    print("Per-seed metrics:", METRICS_PATH)
+    print("Summary CSV     :", METRIC_SUMMARY_CSV_PATH)
+    print("Summary JSON    :", SUMMARY_JSON_PATH)
+    print("Predictions     :", PREDICTIONS_PATH)
+
+    if failed_seeds:
+        raise RuntimeError(
+            f"Failed HDP seeds: {failed_seeds}"
+        )
+
+    print("\n[PASS] HDP baseline completed successfully.")
 
 
-# ============================================================
-# 15. 최종 출력
-# ============================================================
-print("\n" + "=" * 70)
-print("HDP PIPELINE FINISHED")
-print("=" * 70)
-print(f"Successful seeds : {successful_seeds}")
-print(f"Failed seeds     : {failed_seeds}")
-print(f"Model directory  : {MODEL_DIR}")
-print(f"Theta directory  : {THETA_DIR}")
-print(f"Result directory : {RESULT_DIR}")
-print(f"Summary JSON     : {SUMMARY_JSON_PATH}")
-
-if all_metric_rows:
-    print(f"Metrics CSV      : {METRICS_CSV_PATH}")
-
-if failed_seeds:
-    raise RuntimeError(
-        f"HDP 학습 또는 추론에 실패한 seed가 있습니다: {failed_seeds}. "
-        f"위 traceback을 확인하세요."
-    )
-
-print("\n[PASS] 모든 HDP seed의 학습·추론이 완료되었습니다.")
-print(
-    "[NOTE] seed별 theta는 직접 평균하지 않았으며, "
-    "평가 지표의 평균±표준편차만 계산했습니다."
-)
+if __name__ == "__main__":
+    main()
