@@ -550,9 +550,13 @@ def run_seed(
 
 
 # ============================================================
-# Arguments
+# Arguments: Colab + command-line compatible
 # ============================================================
 def parse_arguments() -> argparse.Namespace:
+    default_root = Path(
+        "/content/drive/MyDrive/depth_ot_patent"
+    )
+
     parser = argparse.ArgumentParser(
         description="Train multi-seed online LDA."
     )
@@ -560,93 +564,133 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--train-bow",
         type=Path,
-        required=True,
+        default=(
+            default_root
+            / "data"
+            / "processed"
+            / "bow_train.npz"
+        ),
         help="Path to bow_train.npz",
     )
+
     parser.add_argument(
         "--test-bow",
         type=Path,
-        required=True,
+        default=(
+            default_root
+            / "data"
+            / "processed"
+            / "bow_test.npz"
+        ),
         help="Path to bow_test.npz",
     )
+
     parser.add_argument(
         "--vocab",
         type=Path,
-        default=None,
-        help="Optional vocabulary pickle/npy/json/txt path",
+        default=(
+            default_root
+            / "data"
+            / "processed"
+            / "vocab.pkl"
+        ),
+        help="Vocabulary path",
     )
+
     parser.add_argument(
         "--output-dir",
         type=Path,
-        required=True,
+        default=(
+            default_root
+            / "topic_model"
+            / "lda"
+        ),
         help="Output directory",
     )
+
     parser.add_argument(
         "--topics",
         type=int,
         default=30,
     )
+
     parser.add_argument(
         "--seeds",
         type=int,
         nargs="+",
         default=[42, 43, 44],
     )
+
     parser.add_argument(
         "--max-iter",
         type=int,
         default=50,
     )
+
     parser.add_argument(
         "--batch-size",
         type=int,
         default=1024,
     )
+
     parser.add_argument(
         "--learning-decay",
         type=float,
         default=0.7,
     )
+
     parser.add_argument(
         "--learning-offset",
         type=float,
         default=10.0,
     )
+
     parser.add_argument(
         "--evaluate-every",
         type=int,
         default=5,
     )
+
     parser.add_argument(
         "--n-jobs",
         type=int,
         default=-1,
     )
+
     parser.add_argument(
         "--inference-batch-size",
         type=int,
         default=10_000,
     )
+
     parser.add_argument(
         "--top-words",
         type=int,
         default=20,
     )
+
     parser.add_argument(
         "--verbose",
         type=int,
         default=1,
     )
+
     parser.add_argument(
         "--resume",
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+
     parser.add_argument(
         "--force-inference",
         action="store_true",
     )
 
+    # Colab/Jupyter에서는 자동으로 전달되는 -f kernel.json을 무시
+    if "ipykernel" in sys.modules:
+        return parser.parse_args(args=[])
+
+    # 일반 .py 실행에서는 command-line 인자 사용
     return parser.parse_args()
 
 
