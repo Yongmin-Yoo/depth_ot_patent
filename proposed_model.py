@@ -18863,6 +18863,1263 @@ def build_patent_payload(
 
 
 # ============================================================
+# DEPTH-OT CPC ALIGNMENT EVALUATION
+#
+# Run immediately after Section 9 in the same notebook.
+#
+# Outputs:
+#   - Section/Class/Subclass Pur_p, Pur_a, NMI
+#   - all-claim and valid-BoW-only sensitivity results
+#   - patent predictions
+#   - publication-ready LaTeX row
+# ============================================================
+
+import os
+import json
+import math
+from pathlib import Path
+from collections import defaultdict
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import torch
+from tqdm.auto import tqdm
+
+from sklearn.metrics import normalized_mutual_info_score
+
+
+# ============================================================
+# 0. Configuration
+# ============================================================
+
+# 기존 baseline에서 빈 BoW claim을 제외했다면 이 설정을 유지합니다.
+PRIMARY_POLICY = "valid_bow_only"
+
+# 비교를 위해 두 방식 모두 평가합니다.
+EVALUATION_POLICIES = [
+    "valid_bow_only",
+    "all_claims",
+]
+
+EXPECTED_LABEL_COUNTS = {
+    "section": 9,
+    "class": 121,
+    "subclass": 466,
+}
+
+ROUND_DIGITS = 4
+
+
+# ============================================================
+# 1. Preconditions
+# ============================================================
+
+required_globals = [
+    "SECTION7_RESULT_DIR",
+    "test_dataset",
+]
+
+missing_globals = [
+    name
+    for name in required_globals
+    if name not in globals()
+]
+
+if missing_globals:
+    raise RuntimeError(
+        "필수 Section 7/9 객체가 없습니다: "
+        f"{missing_globals}. "
+        "Section 7과 Section 9를 실행한 같은 노트북에서 "
+        "이 셀을 실행하세요."
+    )
+
+SECTION7_RESULT_DIR = Path(
+    SECTION7_RESULT_DIR
+)
+
+INFERENCE_MANIFEST_PATH = (
+    SECTION7_RESULT_DIR
+    / "inference_manifest.json"
+)
+
+THETA_SHARD_DIR = (
+    SECTION7_RESULT_DIR
+    / "claim_theta_shards"
+)
+
+CPC_RESULT_DIR = (
+    SECTION7_RESULT_DIR
+    / "cpc_alignment"
+)
+
+CPC_RESULT_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+RUN_NAME_CPC = str(
+    globals().get(
+        "RUN_NAME",
+        SECTION7_RESULT_DIR.parent.name,
+    )
+)
+
+FEATURE_RUN_NAME_CPC = str(
+    globals().get(
+        "FEATURE_RUN_NAME",
+        "unknown",
+    )
+)
+
+if not INFERENCE_MANIFEST_PATH.is_file():
+    raise FileNotFoundError(
+        f"Inference manifest가 없습니다: "
+        f"{INFERENCE_MANIFEST_PATH}"
+    )
+
+if not THETA_SHARD_DIR.is_dir():
+    raise FileNotFoundError(
+        f"Theta shard 폴더가 없습니다: "
+        f"{THETA_SHARD_DIR}"
+    )
+
+if not hasattr(
+    test_dataset,
+    "records",
+):
+    raise AttributeError(
+        "test_dataset에 records 속성이 없습니다."
+    )
+
+print("=" * 80)
+print("DEPTH-OT PATENT-LEVEL CPC ALIGNMENT")
+print("=" * 80)
+print(f"Run name         : {RUN_NAME_CPC}")
+print(f"Feature run      : {FEATURE_RUN_NAME_CPC}")
+print(f"Section 7 result : {SECTION7_RESULT_DIR}")
+print(f"Theta shard dir  : {THETA_SHARD_DIR}")
+print(f"Primary policy   : {PRIMARY_POLICY}")
+print("=" * 80)
+
+
+# ============================================================
+# 2. Utility functions
+# ============================================================
+
+def normalize_patent_id(
+    patent_id,
+):
+    normalized = str(
+        patent_id
+    ).strip()
+
+    if not normalized:
+        raise ValueError(
+            "빈 patent_id가 발견되었습니다."
+        )
+
+    return normalized
+
+
+def normalize_single_label(
+    value,
+    field_name,
+    patent_id,
+):
+    """
+    CPC 평가에서는 patent마다 하나의 정답 label이 필요합니다.
+
+    scalar이면 그대로 사용하고, 길이 1짜리 list이면 첫 값을
+    사용합니다. 여러 값이 있으면 preprocessing에서 지정된
+    첫 번째 primary label을 사용하고 경고 개수를 기록합니다.
+    """
+
+    if value is None:
+        return None, False
+
+    if isinstance(
+        value,
+        torch.Tensor,
+    ):
+        if value.ndim == 0:
+            value = value.item()
+        else:
+            value = value.detach().cpu().tolist()
+
+    if isinstance(
+        value,
+        np.ndarray,
+    ):
+        value = value.tolist()
+
+    if isinstance(
+        value,
+        (list, tuple, set),
+    ):
+        values = [
+            item
+            for item in value
+            if item is not None
+            and str(item).strip()
+        ]
+
+        if not values:
+            return None, False
+
+        was_multivalued = (
+            len(values) > 1
+        )
+
+        value = values[0]
+
+    else:
+        was_multivalued = False
+
+    normalized = str(
+        value
+    ).strip()
+
+    if not normalized:
+        return None, was_multivalued
+
+    if normalized.lower() in {
+        "none",
+        "nan",
+        "null",
+        "na",
+    }:
+        return None, was_multivalued
+
+    return normalized, was_multivalued
+
+
+def resolve_shard_path(
+    shard_record,
+):
+    stored_path = shard_record.get(
+        "path"
+    )
+
+    if stored_path:
+        stored_path = Path(
+            stored_path
+        )
+
+        if stored_path.is_file():
+            return stored_path
+
+    filename = shard_record.get(
+        "file"
+    )
+
+    if not filename:
+        raise KeyError(
+            "Shard manifest에 file/path가 없습니다."
+        )
+
+    fallback_path = (
+        THETA_SHARD_DIR
+        / filename
+    )
+
+    if not fallback_path.is_file():
+        raise FileNotFoundError(
+            f"Theta shard를 찾지 못했습니다: "
+            f"{fallback_path}"
+        )
+
+    return fallback_path
+
+
+def calculate_clustering_metrics(
+    true_labels,
+    predicted_topics,
+):
+    true_labels = np.asarray(
+        true_labels,
+        dtype=str,
+    )
+
+    predicted_topics = np.asarray(
+        predicted_topics,
+        dtype=np.int64,
+    )
+
+    if len(true_labels) != len(
+        predicted_topics
+    ):
+        raise ValueError(
+            "정답과 예측 길이가 다릅니다."
+        )
+
+    if len(true_labels) == 0:
+        raise ValueError(
+            "평가할 patent가 없습니다."
+        )
+
+    contingency = pd.crosstab(
+        pd.Series(
+            predicted_topics,
+            name="predicted_topic",
+        ),
+        pd.Series(
+            true_labels,
+            name="true_label",
+        ),
+        dropna=False,
+    )
+
+    matrix = contingency.to_numpy(
+        dtype=np.int64
+    )
+
+    number_of_samples = int(
+        matrix.sum()
+    )
+
+    if number_of_samples == 0:
+        raise ValueError(
+            "Contingency matrix가 비어 있습니다."
+        )
+
+    # Predicted-cluster purity:
+    # 각 predicted cluster에서 가장 많은 true label을 선택
+    pur_p = float(
+        matrix.max(axis=1).sum()
+        / number_of_samples
+    )
+
+    # Inverse label-wise purity:
+    # 각 true label에서 가장 많은 predicted cluster를 선택
+    pur_a = float(
+        matrix.max(axis=0).sum()
+        / number_of_samples
+    )
+
+    nmi = float(
+        normalized_mutual_info_score(
+            true_labels,
+            predicted_topics,
+            average_method="arithmetic",
+        )
+    )
+
+    return {
+        "pur_p": pur_p,
+        "pur_a": pur_a,
+        "nmi": nmi,
+        "number_of_samples": (
+            number_of_samples
+        ),
+        "number_of_true_labels": int(
+            np.unique(
+                true_labels
+            ).size
+        ),
+        "number_of_predicted_topics": int(
+            np.unique(
+                predicted_topics
+            ).size
+        ),
+    }
+
+
+def atomic_json_save(
+    payload,
+    output_path,
+):
+    output_path = Path(
+        output_path
+    )
+
+    temporary_path = (
+        output_path.with_suffix(
+            output_path.suffix + ".tmp"
+        )
+    )
+
+    with open(
+        temporary_path,
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(
+            payload,
+            file,
+            indent=2,
+            ensure_ascii=False,
+            allow_nan=False,
+            default=str,
+        )
+
+    os.replace(
+        temporary_path,
+        output_path,
+    )
+
+
+# ============================================================
+# 3. Load inference manifest
+# ============================================================
+
+with open(
+    INFERENCE_MANIFEST_PATH,
+    "r",
+    encoding="utf-8",
+) as file:
+    inference_manifest_cpc = json.load(
+        file
+    )
+
+if "splits" not in inference_manifest_cpc:
+    raise KeyError(
+        "Inference manifest에 splits가 없습니다."
+    )
+
+if "test" not in inference_manifest_cpc[
+    "splits"
+]:
+    raise KeyError(
+        "Inference manifest에 test split이 없습니다."
+    )
+
+test_manifest = (
+    inference_manifest_cpc[
+        "splits"
+    ]["test"]
+)
+
+test_shard_records = (
+    test_manifest.get(
+        "shards",
+        [],
+    )
+)
+
+if not test_shard_records:
+    raise RuntimeError(
+        "Test theta shard 기록이 없습니다."
+    )
+
+expected_test_patents = int(
+    test_manifest.get(
+        "number_of_patents",
+        len(test_dataset.records),
+    )
+)
+
+expected_test_claims = int(
+    test_manifest.get(
+        "number_of_claims",
+        0,
+    )
+)
+
+print("\n=== TEST INFERENCE MANIFEST ===")
+print(
+    f"Expected patents: "
+    f"{expected_test_patents:,}"
+)
+print(
+    f"Expected claims : "
+    f"{expected_test_claims:,}"
+)
+print(
+    f"Theta shards    : "
+    f"{len(test_shard_records):,}"
+)
+
+
+# ============================================================
+# 4. Build patent-level CPC label lookup
+# ============================================================
+
+label_lookup = {}
+multivalued_label_counts = {
+    "section": 0,
+    "class": 0,
+    "subclass": 0,
+}
+
+missing_label_counts = {
+    "section": 0,
+    "class": 0,
+    "subclass": 0,
+}
+
+for record in tqdm(
+    test_dataset.records,
+    desc="Building CPC label lookup",
+):
+    if "patent_id" not in record:
+        raise KeyError(
+            "Test record에 patent_id가 없습니다."
+        )
+
+    patent_id = normalize_patent_id(
+        record["patent_id"]
+    )
+
+    if patent_id in label_lookup:
+        raise ValueError(
+            f"중복 test patent_id: {patent_id}"
+        )
+
+    normalized_labels = {}
+
+    for level in [
+        "section",
+        "class",
+        "subclass",
+    ]:
+        label, was_multivalued = (
+            normalize_single_label(
+                record.get(level),
+                field_name=level,
+                patent_id=patent_id,
+            )
+        )
+
+        normalized_labels[
+            level
+        ] = label
+
+        if was_multivalued:
+            multivalued_label_counts[
+                level
+            ] += 1
+
+        if label is None:
+            missing_label_counts[
+                level
+            ] += 1
+
+    label_lookup[
+        patent_id
+    ] = normalized_labels
+
+print("\n=== CPC LABEL LOOKUP ===")
+print(
+    f"Test patent records: "
+    f"{len(label_lookup):,}"
+)
+
+for level in [
+    "section",
+    "class",
+    "subclass",
+]:
+    observed_labels = {
+        labels[level]
+        for labels in label_lookup.values()
+        if labels[level] is not None
+    }
+
+    print(
+        f"{level:8s}: "
+        f"labels={len(observed_labels):,}, "
+        f"missing={missing_label_counts[level]:,}, "
+        f"multi-valued={multivalued_label_counts[level]:,}"
+    )
+
+    expected_count = (
+        EXPECTED_LABEL_COUNTS[level]
+    )
+
+    if len(observed_labels) != expected_count:
+        print(
+            f"[WARNING] {level} label 수가 예상과 다릅니다: "
+            f"expected={expected_count}, "
+            f"observed={len(observed_labels)}"
+        )
+
+
+# ============================================================
+# 5. Aggregate claim theta to patent theta
+# ============================================================
+
+all_theta_sum = {}
+all_claim_count = defaultdict(int)
+
+valid_theta_sum = {}
+valid_claim_count = defaultdict(int)
+
+seen_claim_keys = set()
+
+number_of_topics = None
+loaded_claims = 0
+loaded_valid_claims = 0
+loaded_empty_claims = 0
+
+for shard_record in tqdm(
+    test_shard_records,
+    desc="Aggregating test theta shards",
+):
+    shard_path = resolve_shard_path(
+        shard_record
+    )
+
+    shard = torch.load(
+        shard_path,
+        map_location="cpu",
+        weights_only=False,
+    )
+
+    if shard.get("split") != "test":
+        raise ValueError(
+            f"Test가 아닌 shard가 포함되었습니다: "
+            f"{shard_path}"
+        )
+
+    theta = (
+        shard["theta"]
+        .detach()
+        .double()
+        .cpu()
+    )
+
+    bow_valid = (
+        shard["bow_valid"]
+        .detach()
+        .bool()
+        .cpu()
+    )
+
+    claim_keys = shard[
+        "claim_keys"
+    ]
+
+    if theta.ndim != 2:
+        raise ValueError(
+            f"Theta는 2차원이어야 합니다: "
+            f"{tuple(theta.shape)}"
+        )
+
+    shard_claim_count = int(
+        theta.shape[0]
+    )
+
+    shard_topic_count = int(
+        theta.shape[1]
+    )
+
+    if number_of_topics is None:
+        number_of_topics = (
+            shard_topic_count
+        )
+
+    elif number_of_topics != shard_topic_count:
+        raise ValueError(
+            "Shard 간 topic 수가 다릅니다."
+        )
+
+    if len(claim_keys) != shard_claim_count:
+        raise ValueError(
+            f"Claim key/theta 길이 불일치: "
+            f"{shard_path}"
+        )
+
+    if bow_valid.shape != (
+        shard_claim_count,
+    ):
+        raise ValueError(
+            f"bow_valid shape 불일치: "
+            f"{shard_path}"
+        )
+
+    if not torch.isfinite(
+        theta
+    ).all():
+        raise FloatingPointError(
+            f"Theta에 NaN/Inf가 있습니다: "
+            f"{shard_path}"
+        )
+
+    if torch.any(
+        theta < -1e-8
+    ):
+        raise ValueError(
+            f"Theta에 음수가 있습니다: "
+            f"{shard_path}"
+        )
+
+    theta = torch.clamp(
+        theta,
+        min=0.0,
+    )
+
+    theta_row_sums = theta.sum(
+        dim=1,
+        keepdim=True,
+    )
+
+    if torch.any(
+        theta_row_sums <= 0
+    ):
+        raise ValueError(
+            f"Theta 합이 0인 claim이 있습니다: "
+            f"{shard_path}"
+        )
+
+    theta = theta / theta_row_sums
+
+    for position, claim_key in enumerate(
+        claim_keys
+    ):
+        if (
+            not isinstance(
+                claim_key,
+                (list, tuple),
+            )
+            or len(claim_key) != 2
+        ):
+            raise ValueError(
+                f"잘못된 claim key: {claim_key}"
+            )
+
+        patent_id = normalize_patent_id(
+            claim_key[0]
+        )
+
+        claim_id = int(
+            claim_key[1]
+        )
+
+        normalized_claim_key = (
+            patent_id,
+            claim_id,
+        )
+
+        if normalized_claim_key in seen_claim_keys:
+            raise ValueError(
+                f"중복 claim key: "
+                f"{normalized_claim_key}"
+            )
+
+        seen_claim_keys.add(
+            normalized_claim_key
+        )
+
+        theta_row = theta[
+            position
+        ].numpy()
+
+        if patent_id not in all_theta_sum:
+            all_theta_sum[
+                patent_id
+            ] = np.zeros(
+                number_of_topics,
+                dtype=np.float64,
+            )
+
+        all_theta_sum[
+            patent_id
+        ] += theta_row
+
+        all_claim_count[
+            patent_id
+        ] += 1
+
+        is_valid_bow = bool(
+            bow_valid[
+                position
+            ].item()
+        )
+
+        if is_valid_bow:
+            if patent_id not in valid_theta_sum:
+                valid_theta_sum[
+                    patent_id
+                ] = np.zeros(
+                    number_of_topics,
+                    dtype=np.float64,
+                )
+
+            valid_theta_sum[
+                patent_id
+            ] += theta_row
+
+            valid_claim_count[
+                patent_id
+            ] += 1
+
+            loaded_valid_claims += 1
+
+        else:
+            loaded_empty_claims += 1
+
+        loaded_claims += 1
+
+    del shard
+    del theta
+    del bow_valid
+
+if expected_test_claims > 0:
+    if loaded_claims != expected_test_claims:
+        raise RuntimeError(
+            "Test claim 수가 manifest와 다릅니다: "
+            f"loaded={loaded_claims:,}, "
+            f"expected={expected_test_claims:,}"
+        )
+
+if len(all_theta_sum) != expected_test_patents:
+    raise RuntimeError(
+        "Test patent 수가 manifest와 다릅니다: "
+        f"aggregated={len(all_theta_sum):,}, "
+        f"expected={expected_test_patents:,}"
+    )
+
+print("\n=== THETA AGGREGATION ===")
+print(
+    f"Topics           : "
+    f"{number_of_topics}"
+)
+print(
+    f"Claims loaded    : "
+    f"{loaded_claims:,}"
+)
+print(
+    f"Valid-BoW claims : "
+    f"{loaded_valid_claims:,}"
+)
+print(
+    f"Empty-BoW claims : "
+    f"{loaded_empty_claims:,}"
+)
+print(
+    f"All patents      : "
+    f"{len(all_theta_sum):,}"
+)
+print(
+    f"Patents with >=1 valid claim: "
+    f"{len(valid_theta_sum):,}"
+)
+
+
+# ============================================================
+# 6. Create patent predictions for each policy
+# ============================================================
+
+prediction_frames = {}
+
+for policy in EVALUATION_POLICIES:
+    prediction_rows = []
+
+    for patent_id in sorted(
+        all_theta_sum.keys()
+    ):
+        if patent_id not in label_lookup:
+            continue
+
+        if policy == "all_claims":
+            theta_sum = all_theta_sum[
+                patent_id
+            ]
+
+            claim_count = all_claim_count[
+                patent_id
+            ]
+
+        elif policy == "valid_bow_only":
+            if valid_claim_count[
+                patent_id
+            ] <= 0:
+                continue
+
+            theta_sum = valid_theta_sum[
+                patent_id
+            ]
+
+            claim_count = valid_claim_count[
+                patent_id
+            ]
+
+        else:
+            raise ValueError(
+                f"알 수 없는 policy: {policy}"
+            )
+
+        patent_theta = (
+            theta_sum
+            / max(
+                claim_count,
+                1,
+            )
+        )
+
+        patent_theta_sum = float(
+            patent_theta.sum()
+        )
+
+        if (
+            not math.isfinite(
+                patent_theta_sum
+            )
+            or patent_theta_sum <= 0
+        ):
+            raise FloatingPointError(
+                f"유효하지 않은 patent theta: "
+                f"{patent_id}"
+            )
+
+        patent_theta = (
+            patent_theta
+            / patent_theta_sum
+        )
+
+        predicted_topic = int(
+            np.argmax(
+                patent_theta
+            )
+        )
+
+        dominant_probability = float(
+            patent_theta[
+                predicted_topic
+            ]
+        )
+
+        labels = label_lookup[
+            patent_id
+        ]
+
+        prediction_rows.append(
+            {
+                "run_name": RUN_NAME_CPC,
+                "feature_run": (
+                    FEATURE_RUN_NAME_CPC
+                ),
+                "aggregation_policy": policy,
+                "patent_id": patent_id,
+                "predicted_topic": (
+                    predicted_topic
+                ),
+                "predicted_topic_number": (
+                    predicted_topic + 1
+                ),
+                "dominant_probability": (
+                    dominant_probability
+                ),
+                "claims_used": int(
+                    claim_count
+                ),
+                "all_claims": int(
+                    all_claim_count[
+                        patent_id
+                    ]
+                ),
+                "valid_bow_claims": int(
+                    valid_claim_count[
+                        patent_id
+                    ]
+                ),
+                "section": labels[
+                    "section"
+                ],
+                "class": labels[
+                    "class"
+                ],
+                "subclass": labels[
+                    "subclass"
+                ],
+            }
+        )
+
+    prediction_frame = pd.DataFrame(
+        prediction_rows
+    )
+
+    if prediction_frame.empty:
+        raise RuntimeError(
+            f"{policy} prediction이 비어 있습니다."
+        )
+
+    prediction_frames[
+        policy
+    ] = prediction_frame
+
+    coverage = (
+        len(prediction_frame)
+        / max(
+            len(label_lookup),
+            1,
+        )
+    )
+
+    print(
+        f"\nPolicy={policy}: "
+        f"patents={len(prediction_frame):,}, "
+        f"coverage={coverage:.4%}"
+    )
+
+
+# ============================================================
+# 7. Evaluate Section/Class/Subclass
+# ============================================================
+
+metric_rows = []
+
+for policy in EVALUATION_POLICIES:
+    predictions = prediction_frames[
+        policy
+    ]
+
+    for level in [
+        "section",
+        "class",
+        "subclass",
+    ]:
+        evaluation_frame = (
+            predictions[
+                predictions[level].notna()
+            ]
+            .copy()
+        )
+
+        metrics = (
+            calculate_clustering_metrics(
+                true_labels=(
+                    evaluation_frame[
+                        level
+                    ].to_numpy()
+                ),
+                predicted_topics=(
+                    evaluation_frame[
+                        "predicted_topic"
+                    ].to_numpy()
+                ),
+            )
+        )
+
+        metric_row = {
+            "run_name": RUN_NAME_CPC,
+            "feature_run": (
+                FEATURE_RUN_NAME_CPC
+            ),
+            "aggregation_policy": policy,
+            "level": level,
+            **metrics,
+        }
+
+        metric_rows.append(
+            metric_row
+        )
+
+        print(
+            f"{policy:16s} | "
+            f"{level:8s} | "
+            f"Pur_p={metrics['pur_p']:.4f} | "
+            f"Pur_a={metrics['pur_a']:.4f} | "
+            f"NMI={metrics['nmi']:.4f} | "
+            f"N={metrics['number_of_samples']:,} | "
+            f"labels={metrics['number_of_true_labels']:,} | "
+            f"topics={metrics['number_of_predicted_topics']:,}"
+        )
+
+metrics_df = pd.DataFrame(
+    metric_rows
+)
+
+
+# ============================================================
+# 8. Save outputs
+# ============================================================
+
+metrics_csv_path = (
+    CPC_RESULT_DIR
+    / "depth_ot_cpc_alignment_metrics.csv"
+)
+
+predictions_csv_path = (
+    CPC_RESULT_DIR
+    / "depth_ot_patent_predictions.csv"
+)
+
+summary_json_path = (
+    CPC_RESULT_DIR
+    / "depth_ot_cpc_alignment_summary.json"
+)
+
+metrics_df.to_csv(
+    metrics_csv_path,
+    index=False,
+)
+
+all_prediction_frames = pd.concat(
+    [
+        prediction_frames[
+            policy
+        ]
+        for policy in EVALUATION_POLICIES
+    ],
+    ignore_index=True,
+)
+
+all_prediction_frames.to_csv(
+    predictions_csv_path,
+    index=False,
+)
+
+summary_payload = {
+    "run_name": RUN_NAME_CPC,
+    "feature_run": FEATURE_RUN_NAME_CPC,
+    "created_at": (
+        datetime.now().isoformat()
+    ),
+    "number_of_topics": (
+        number_of_topics
+    ),
+    "primary_policy": (
+        PRIMARY_POLICY
+    ),
+    "policy_description": {
+        "valid_bow_only": (
+            "Patent theta is the normalized mean of claim theta "
+            "over claims containing at least one fixed-vocabulary "
+            "term. Patents with no valid-BoW claims are excluded."
+        ),
+        "all_claims": (
+            "Patent theta is the normalized mean of all claim "
+            "theta values, including empty-BoW claims."
+        ),
+    },
+    "claim_counts": {
+        "total": loaded_claims,
+        "valid_bow": loaded_valid_claims,
+        "empty_bow": loaded_empty_claims,
+    },
+    "patent_counts": {
+        "total_test_records": len(
+            label_lookup
+        ),
+        "all_claim_predictions": len(
+            prediction_frames[
+                "all_claims"
+            ]
+        ),
+        "valid_bow_predictions": len(
+            prediction_frames[
+                "valid_bow_only"
+            ]
+        ),
+    },
+    "metrics": (
+        metrics_df.to_dict(
+            orient="records"
+        )
+    ),
+    "files": {
+        "metrics_csv": str(
+            metrics_csv_path
+        ),
+        "predictions_csv": str(
+            predictions_csv_path
+        ),
+    },
+}
+
+atomic_json_save(
+    summary_payload,
+    summary_json_path,
+)
+
+
+# ============================================================
+# 9. Print publication-ready result
+# ============================================================
+
+primary_metrics = (
+    metrics_df[
+        metrics_df[
+            "aggregation_policy"
+        ] == PRIMARY_POLICY
+    ]
+    .set_index("level")
+)
+
+required_levels = {
+    "section",
+    "class",
+    "subclass",
+}
+
+if not required_levels.issubset(
+    set(primary_metrics.index)
+):
+    raise RuntimeError(
+        "Primary policy의 CPC 결과가 불완전합니다."
+    )
+
+latex_values = []
+
+for level in [
+    "section",
+    "class",
+    "subclass",
+]:
+    for metric in [
+        "pur_p",
+        "pur_a",
+        "nmi",
+    ]:
+        value = float(
+            primary_metrics.loc[
+                level,
+                metric,
+            ]
+        )
+
+        latex_values.append(
+            f"{value:.{ROUND_DIGITS}f}"
+        )
+
+latex_row = (
+    r"\textbf{Depth-OT (ours)}"
+    + " & "
+    + " & ".join(
+        rf"\textbf{{{value}}}"
+        for value in latex_values
+    )
+    + r" \\"
+)
+
+print("\n" + "=" * 80)
+print("DEPTH-OT CPC ALIGNMENT COMPLETED")
+print("=" * 80)
+print(
+    f"Primary policy: "
+    f"{PRIMARY_POLICY}"
+)
+
+for level in [
+    "section",
+    "class",
+    "subclass",
+]:
+    row = primary_metrics.loc[
+        level
+    ]
+
+    print(
+        f"{level:8s}: "
+        f"Pur_p={row['pur_p']:.4f}, "
+        f"Pur_a={row['pur_a']:.4f}, "
+        f"NMI={row['nmi']:.4f}, "
+        f"N={int(row['number_of_samples']):,}"
+    )
+
+print("\n=== LATEX TABLE ROW ===")
+print(latex_row)
+
+print("\n=== SAVED FILES ===")
+print(f"Metrics     : {metrics_csv_path}")
+print(f"Predictions : {predictions_csv_path}")
+print(f"Summary JSON: {summary_json_path}")
+print("=" * 80)
+
+
+# ============================================================
 # 10. Qualitative-example helper
 # ============================================================
 
