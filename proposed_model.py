@@ -10440,6 +10440,10 @@ print(
 # Requirements:
 #   Run Sections 0–5 first.
 # ============================================================
+# ============================================================
+# SECTION 6 — T4-OPTIMIZED ANTI-COLLAPSE TRAINING
+# Fresh run / patents_per_batch=8 / no resume
+# ============================================================
 
 import os
 import gc
@@ -10448,6 +10452,7 @@ import time
 import math
 import random
 import traceback
+from pathlib import Path
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
 
@@ -10461,10 +10466,7 @@ from tqdm.auto import tqdm
 # 0. Preconditions
 # ============================================================
 
-EXPECTED_PATENTS_PER_BATCH = 8
-CONFIG.patents_per_batch = 8
-
-required_globals = [
+REQUIRED_GLOBALS = [
     "CONFIG",
     "DIRS",
     "DEVICE",
@@ -10485,296 +10487,210 @@ required_globals = [
 ]
 
 missing_globals = [
-    name
-    for name in required_globals
+    name for name in REQUIRED_GLOBALS
     if name not in globals()
 ]
 
 if missing_globals:
     raise RuntimeError(
-        "Section 6 prerequisites are missing: "
-        f"{missing_globals}. "
-        "L4 런타임에서 Sections 0~5를 먼저 실행하세요."
+        "Sections 0–5를 먼저 실행하세요. "
+        f"Missing globals: {missing_globals}"
     )
-
-
-# ============================================================
-# 1. Training configuration
-# ============================================================
-
-NUM_EPOCHS = 12
-
-EARLY_STOPPING_PATIENCE = 3
-EARLY_STOPPING_START_EPOCH = 6
-MINIMUM_IMPROVEMENT = 1e-4
-
-MAX_GRAD_NORM = 1.0
-
-CHECKPOINT_INTERVAL_EPOCHS = 3
-SAVE_LATEST_EVERY_EPOCH = True
-
-# ------------------------------------------------------------
-# Resume configuration
-# ------------------------------------------------------------
-
-RESUME_TRAINING = True
-
-# 기존 실행 폴더 이름
-RESUME_RUN_NAME = "depth_ot_full_20260811_215645"
-
-# checkpoint가 없을 때 새 학습을 시작하지 않음
-ALLOW_NEW_RUN_IF_CHECKPOINT_MISSING = False
-
-# ------------------------------------------------------------
-# Numerical configuration
-# ------------------------------------------------------------
-
-# Sinkhorn/hierarchy 안정성을 위해 FP32 유지
-USE_MIXED_PRECISION = False
-
-KL_WARMUP_EPOCHS = 3
-HIERARCHY_WARMUP_EPOCHS = 3
-RECONCILIATION_WARMUP_EPOCHS = 3
-DIVERSITY_WARMUP_EPOCHS = 3
-PHI_WARMUP_EPOCHS = 3
-
-# ------------------------------------------------------------
-# L4 optimization
-# ------------------------------------------------------------
-
-REBUILD_LOADERS_FOR_L4 = True
-
-L4_NUM_WORKERS = min(
-    4,
-    max(
-        2,
-        (os.cpu_count() or 2) // 2,
-    ),
-)
-
-L4_PREFETCH_FACTOR = 4
-
-# tqdm GPU→CPU 동기화 감소
-TRAIN_POSTFIX_INTERVAL = 100
-EVAL_POSTFIX_INTERVAL = 100
-
-# 기존 run이 patents_per_batch=8로 시작했으므로 유지
-EXPECTED_PATENTS_PER_BATCH = 8
-
-
-# ============================================================
-# 2. Propagate settings to CONFIG
-# ============================================================
-
-training_config_overrides = {
-    "num_epochs": NUM_EPOCHS,
-    "early_stopping_patience": EARLY_STOPPING_PATIENCE,
-    "early_stopping_start_epoch": EARLY_STOPPING_START_EPOCH,
-    "minimum_improvement": MINIMUM_IMPROVEMENT,
-    "max_grad_norm": MAX_GRAD_NORM,
-    "checkpoint_every_epoch": CHECKPOINT_INTERVAL_EPOCHS,
-    "checkpoint_interval_epochs": CHECKPOINT_INTERVAL_EPOCHS,
-    "kl_warmup_epochs": KL_WARMUP_EPOCHS,
-    "hierarchy_warmup_epochs": HIERARCHY_WARMUP_EPOCHS,
-    "reconciliation_warmup_epochs": RECONCILIATION_WARMUP_EPOCHS,
-    "diversity_warmup_epochs": DIVERSITY_WARMUP_EPOCHS,
-    "phi_warmup_epochs": PHI_WARMUP_EPOCHS,
-}
-
-for key, value in training_config_overrides.items():
-    try:
-        setattr(
-            CONFIG,
-            key,
-            value,
-        )
-    except Exception as error:
-        raise RuntimeError(
-            f"Could not set CONFIG.{key}={value}."
-        ) from error
-
-
-# ============================================================
-# 3. Validate configuration
-# ============================================================
-
-if NUM_EPOCHS < 1:
-    raise ValueError(
-        "NUM_EPOCHS must be positive."
-    )
-
-if EARLY_STOPPING_PATIENCE < 1:
-    raise ValueError(
-        "EARLY_STOPPING_PATIENCE must be positive."
-    )
-
-if not (
-    1
-    <= EARLY_STOPPING_START_EPOCH
-    <= NUM_EPOCHS
-):
-    raise ValueError(
-        "Invalid EARLY_STOPPING_START_EPOCH."
-    )
-
-if CHECKPOINT_INTERVAL_EPOCHS < 1:
-    raise ValueError(
-        "CHECKPOINT_INTERVAL_EPOCHS must be positive."
-    )
-
-if MAX_GRAD_NORM <= 0:
-    raise ValueError(
-        "MAX_GRAD_NORM must be positive."
-    )
-
-if MINIMUM_IMPROVEMENT < 0:
-    raise ValueError(
-        "MINIMUM_IMPROVEMENT must be non-negative."
-    )
-
-configured_patents_per_batch = getattr(
-    CONFIG,
-    "patents_per_batch",
-    None,
-)
-
-if (
-    configured_patents_per_batch is not None
-    and int(configured_patents_per_batch)
-    != EXPECTED_PATENTS_PER_BATCH
-):
-    raise ValueError(
-        "Resume 중 patents_per_batch를 변경하면 안 됩니다. "
-        f"Expected={EXPECTED_PATENTS_PER_BATCH}, "
-        f"current={configured_patents_per_batch}. "
-        "Sections 0~5에서 patents_per_batch=8로 설정하세요."
-    )
-
-
-# ============================================================
-# 4. CUDA/L4 setup
-# ============================================================
 
 if not torch.cuda.is_available():
     raise RuntimeError(
-        "CUDA GPU가 없습니다. "
-        "Colab 런타임에서 L4 GPU를 선택하세요."
+        "CUDA GPU가 없습니다. Colab에서 T4 GPU를 선택하세요."
     )
 
 DEVICE = torch.device("cuda:0")
-
-depth_ot_model.to(
-    DEVICE
+GPU_NAME = torch.cuda.get_device_name(0)
+GPU_TOTAL_GIB = (
+    torch.cuda.get_device_properties(0).total_memory / 2**30
 )
 
-topic_anchor.to(
-    DEVICE
+if "T4" not in GPU_NAME:
+    print(
+        f"[WARNING] 현재 GPU는 {GPU_NAME}입니다. "
+        "코드는 T4 기준으로 설정되었습니다."
+    )
+
+
+# ============================================================
+# 1. Core experiment settings
+# ============================================================
+
+SEED = 42
+PATENTS_PER_BATCH = 8
+NUM_EPOCHS = 24
+
+# 완전 신규 실행
+RESUME_TRAINING = False
+
+RUN_TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+RUN_NAME = (
+    f"depth_ot_anticollapse_seed{SEED}_{RUN_TIMESTAMP}"
 )
+
+# ------------------------------------------------------------
+# Objective schedule
+# ------------------------------------------------------------
+
+# Epoch 1–3: reconstruction/topic separation 중심
+KL_START_EPOCH = 3
+KL_FULL_EPOCH = 12
+KL_MAX_WEIGHT = 0.10
+
+# Epoch 1–8: hierarchy 비활성화
+HIERARCHY_START_EPOCH = 8
+HIERARCHY_FULL_EPOCH = 16
+HIERARCHY_MAX_WEIGHT = 0.15
+
+# Phi 역시 hierarchy와 함께 늦게 시작
+PHI_START_EPOCH = 8
+
+# ------------------------------------------------------------
+# Anti-collapse regularization
+# ------------------------------------------------------------
+
+BALANCE_WEIGHT_INITIAL = 2.00
+BALANCE_WEIGHT_FINAL = 0.60
+
+USAGE_WEIGHT_INITIAL = 1.00
+USAGE_WEIGHT_FINAL = 0.30
+
+CONFIDENCE_WEIGHT_INITIAL = 0.05
+CONFIDENCE_WEIGHT_FINAL = 0.02
+
+BALANCE_TEMPERATURE_INITIAL = 0.30
+BALANCE_TEMPERATURE_FINAL = 0.15
+
+BALANCE_SINKHORN_ITERATIONS = 5
+
+# ------------------------------------------------------------
+# Best-checkpoint requirements
+# ------------------------------------------------------------
+
+MIN_ACTIVE_TOPICS = 20
+MAX_TOPIC_SHARE = 0.25
+MIN_MARGINAL_ENTROPY = 0.70
+
+# ------------------------------------------------------------
+# Evaluation frequency
+# ------------------------------------------------------------
+
+# 짝수 epoch 및 마지막 epoch: 전체 DEV
+FULL_DEV_EVERY_EPOCHS = 2
+
+# 나머지 epoch: 앞부분 DEV batch만 빠르게 평가
+FAST_DEV_BATCHES = 200
+
+# ------------------------------------------------------------
+# Early stopping
+# ------------------------------------------------------------
+
+EARLY_STOPPING_START_EPOCH = 12
+
+# Full DEV 평가 기준 3회
+EARLY_STOPPING_PATIENCE = 3
+MINIMUM_IMPROVEMENT = 1e-4
+
+# ------------------------------------------------------------
+# Optimization
+# ------------------------------------------------------------
+
+MAX_GRAD_NORM = 1.0
+CHECKPOINT_INTERVAL_EPOCHS = 3
+
+TRAIN_POSTFIX_INTERVAL = 100
+EVAL_POSTFIX_INTERVAL = 100
+
+# Sinkhorn 안정성을 위해 전체 AMP는 사용하지 않음.
+# TF32는 활성화하므로 T4 Tensor Core를 일부 활용함.
+USE_MIXED_PRECISION = False
+
+# DataLoader
+T4_NUM_WORKERS = min(
+    4,
+    max(2, (os.cpu_count() or 2) // 2),
+)
+
+T4_PREFETCH_FACTOR = 4
+
+
+# ============================================================
+# 2. Seed and CUDA setup
+# ============================================================
+
+os.environ["PYTHONHASHSEED"] = str(SEED)
+
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 
 try:
-    torch.set_float32_matmul_precision(
-        "high"
-    )
+    torch.set_float32_matmul_precision("high")
 except Exception:
     pass
 
-GPU_NAME = torch.cuda.get_device_name(0)
+depth_ot_model.to(DEVICE)
+topic_anchor.to(DEVICE)
 
-GPU_TOTAL_GIB = (
-    torch.cuda.get_device_properties(0).total_memory
-    / 2**30
-)
+CONFIG.seed = SEED
+CONFIG.patents_per_batch = PATENTS_PER_BATCH
 
-print("=" * 90)
-print("SECTION 6 — L4 OPTIMIZED RESUME-SAFE TRAINING")
-print("=" * 90)
-print(f"GPU                      : {GPU_NAME}")
-print(f"GPU memory               : {GPU_TOTAL_GIB:.2f} GiB")
-print(f"Device                   : {DEVICE}")
-print(f"TF32                     : enabled")
-print(f"Mixed precision          : {USE_MIXED_PRECISION}")
-print(f"Resume training          : {RESUME_TRAINING}")
-print(f"Resume run               : {RESUME_RUN_NAME}")
-print(f"Maximum epochs           : {NUM_EPOCHS}")
-print(f"Patents/batch            : {configured_patents_per_batch}")
-print("=" * 90)
+if int(CONFIG.patents_per_batch) != PATENTS_PER_BATCH:
+    raise RuntimeError(
+        "CONFIG.patents_per_batch는 반드시 8이어야 합니다."
+    )
 
 
 # ============================================================
-# 5. Optimizer helper
+# 3. DataLoader optimization
 # ============================================================
 
-def optimizer_to_device(
-    optimizer,
-    target_device,
-):
-    for optimizer_state in optimizer.state.values():
-        for key, value in optimizer_state.items():
-            if torch.is_tensor(value):
-                optimizer_state[key] = value.to(
-                    target_device
-                )
-
-
-# ============================================================
-# 6. L4 DataLoader optimization
-# ============================================================
-
-def loader_is_already_optimized(
-    loader,
-):
+def loader_is_t4_optimized(loader):
     return (
-        getattr(
-            loader,
-            "num_workers",
-            0,
-        ) == L4_NUM_WORKERS
-        and getattr(
-            loader,
-            "pin_memory",
-            False,
+        getattr(loader, "num_workers", 0)
+        == T4_NUM_WORKERS
+        and bool(
+            getattr(loader, "pin_memory", False)
         )
-        and getattr(
-            loader,
-            "persistent_workers",
-            False,
+        and bool(
+            getattr(loader, "persistent_workers", False)
         )
     )
 
 
-def rebuild_loader_for_l4(
+def rebuild_loader_for_t4(
     original_loader,
     loader_name,
 ):
-    if loader_is_already_optimized(
-        original_loader
-    ):
+    if loader_is_t4_optimized(original_loader):
         print(
-            f"[L4 Loader] {loader_name} "
-            "is already optimized."
+            f"[Loader] {loader_name}: already optimized"
         )
-
         return original_loader
 
     print(
-        f"[L4 Loader] Rebuilding {loader_name}: "
-        f"workers={L4_NUM_WORKERS}, "
+        f"[Loader] {loader_name}: rebuilding | "
+        f"workers={T4_NUM_WORKERS}, "
         f"pin_memory=True, "
-        f"prefetch={L4_PREFETCH_FACTOR}"
+        f"prefetch={T4_PREFETCH_FACTOR}"
     )
 
     return DataLoader(
         dataset=original_loader.dataset,
         batch_sampler=original_loader.batch_sampler,
         collate_fn=original_loader.collate_fn,
-        num_workers=L4_NUM_WORKERS,
+        num_workers=T4_NUM_WORKERS,
         pin_memory=True,
         persistent_workers=True,
-        prefetch_factor=L4_PREFETCH_FACTOR,
+        prefetch_factor=T4_PREFETCH_FACTOR,
         worker_init_fn=getattr(
             original_loader,
             "worker_init_fn",
@@ -10783,323 +10699,485 @@ def rebuild_loader_for_l4(
     )
 
 
-if REBUILD_LOADERS_FOR_L4:
-    original_train_loader = train_loader
-    original_dev_loader = dev_loader
-    original_test_loader = test_loader
+original_train_loader = train_loader
+original_dev_loader = dev_loader
+original_test_loader = test_loader
 
-    try:
-        train_loader = rebuild_loader_for_l4(
-            original_train_loader,
-            "train",
-        )
+try:
+    train_loader = rebuild_loader_for_t4(
+        original_train_loader,
+        "train",
+    )
 
-        dev_loader = rebuild_loader_for_l4(
-            original_dev_loader,
-            "dev",
-        )
+    dev_loader = rebuild_loader_for_t4(
+        original_dev_loader,
+        "dev",
+    )
 
-        test_loader = rebuild_loader_for_l4(
-            original_test_loader,
-            "test",
-        )
+    test_loader = rebuild_loader_for_t4(
+        original_test_loader,
+        "test",
+    )
 
-        print(
-            "[PASS] L4 DataLoaders are ready."
-        )
+except Exception as loader_error:
+    print(
+        f"[WARNING] DataLoader 최적화 실패: "
+        f"{loader_error}"
+    )
+    print("[Fallback] 기존 DataLoader를 사용합니다.")
 
-    except Exception as error:
-        print(
-            f"[WARNING] L4 DataLoader rebuild failed: "
-            f"{error}"
-        )
-        print(
-            "[Fallback] Original DataLoaders will be used."
-        )
-
-        train_loader = original_train_loader
-        dev_loader = original_dev_loader
-        test_loader = original_test_loader
+    train_loader = original_train_loader
+    dev_loader = original_dev_loader
+    test_loader = original_test_loader
 
 
 # ============================================================
-# 7. Validate loader
+# 4. CONFIG overrides
 # ============================================================
 
-train_batch_sampler = getattr(
-    train_loader,
-    "batch_sampler",
-    None,
+CONFIG.num_epochs = NUM_EPOCHS
+CONFIG.patents_per_batch = PATENTS_PER_BATCH
+
+CONFIG.kl_warmup_epochs = KL_FULL_EPOCH
+CONFIG.hierarchy_warmup_epochs = HIERARCHY_FULL_EPOCH
+CONFIG.phi_warmup_epochs = PHI_START_EPOCH
+
+CONFIG.kl_warmup_steps = (
+    len(train_loader) * KL_FULL_EPOCH
 )
 
-print("\n=== TRAIN LOADER CHECK ===")
-print(
-    "Batch sampler              : "
-    f"{type(train_batch_sampler).__name__}"
-)
-print(
-    "Supports set_epoch         : "
-    f"{hasattr(train_batch_sampler, 'set_epoch')}"
-)
-print(
-    f"Train batches              : "
-    f"{len(train_loader):,}"
-)
-print(
-    "Configured patents/batch   : "
-    f"{configured_patents_per_batch}"
-)
-print(
-    f"Workers                    : "
-    f"{getattr(train_loader, 'num_workers', 0)}"
-)
-print(
-    f"Pinned memory              : "
-    f"{getattr(train_loader, 'pin_memory', False)}"
+CONFIG.hierarchy_warmup_steps = (
+    len(train_loader) * HIERARCHY_FULL_EPOCH
 )
 
-if hasattr(
-    train_batch_sampler,
-    "set_epoch",
+CONFIG.kl_max_weight = KL_MAX_WEIGHT
+CONFIG.hierarchy_max_weight = HIERARCHY_MAX_WEIGHT
+
+# 프로젝트 내부에서 다른 이름을 사용하는 경우에도 적용
+CONFIG_ALIASES = {
+    "gamma_kl": KL_MAX_WEIGHT,
+    "kl_weight": KL_MAX_WEIGHT,
+    "gamma_h": HIERARCHY_MAX_WEIGHT,
+    "gamma_hierarchy": HIERARCHY_MAX_WEIGHT,
+    "hierarchy_weight": HIERARCHY_MAX_WEIGHT,
+}
+
+for config_name, config_value in CONFIG_ALIASES.items():
+    if hasattr(CONFIG, config_name):
+        setattr(
+            CONFIG,
+            config_name,
+            config_value,
+        )
+
+# ============================================================
+# 5. Objective weight override — recursion-safe
+# ============================================================
+
+_BASE_OBJECTIVE_WEIGHT_FUNCTION = get_objective_weights
+
+
+def linear_ramp(
+    epoch,
+    start_epoch,
+    full_epoch,
+    maximum,
 ):
-    print(
-        "[PASS] Epoch-aware batch sampler is active."
+    epoch_one_based = epoch + 1
+
+    if epoch_one_based <= start_epoch:
+        return 0.0
+
+    if epoch_one_based >= full_epoch:
+        return float(maximum)
+
+    progress = (
+        epoch_one_based - start_epoch
+    ) / max(
+        full_epoch - start_epoch,
+        1,
     )
-else:
-    print(
-        "[WARNING] Batch sampler has no set_epoch()."
+
+    return float(maximum * progress)
+
+
+def make_scheduled_objective_weight_function(base_function):
+
+    def scheduled_objective_weights(epoch):
+        original_weights = base_function(epoch)
+        weights = dict(original_weights)
+
+        kl_weight = linear_ramp(
+            epoch=epoch,
+            start_epoch=KL_START_EPOCH,
+            full_epoch=KL_FULL_EPOCH,
+            maximum=KL_MAX_WEIGHT,
+        )
+
+        hierarchy_weight = linear_ramp(
+            epoch=epoch,
+            start_epoch=HIERARCHY_START_EPOCH,
+            full_epoch=HIERARCHY_FULL_EPOCH,
+            maximum=HIERARCHY_MAX_WEIGHT,
+        )
+
+        found_kl = False
+        found_hierarchy = False
+
+        for key in list(weights):
+            normalized_key = str(key).lower()
+
+            if "kl" in normalized_key:
+                weights[key] = kl_weight
+                found_kl = True
+
+            elif (
+                "hier" in normalized_key
+                and "recon" not in normalized_key
+            ):
+                weights[key] = hierarchy_weight
+                found_hierarchy = True
+
+        if not found_kl:
+            weights["kl"] = kl_weight
+
+        if not found_hierarchy:
+            weights["hierarchy"] = hierarchy_weight
+
+        return weights
+
+    scheduled_objective_weights._anti_collapse_override = True
+    return scheduled_objective_weights
+
+
+get_objective_weights = (
+    make_scheduled_objective_weight_function(
+        _BASE_OBJECTIVE_WEIGHT_FUNCTION
     )
+)
+
 
 
 # ============================================================
-# 8. Print configuration
+# 6. Anti-collapse schedule
 # ============================================================
 
-print("\n=== TRAINING CONFIGURATION ===")
-print(f"Feature run                  : {FEATURE_RUN_NAME}")
-print(f"Maximum epochs               : {NUM_EPOCHS}")
-print(f"KL warm-up                   : {KL_WARMUP_EPOCHS}")
-print(f"Hierarchy warm-up            : {HIERARCHY_WARMUP_EPOCHS}")
-print(f"Reconciliation warm-up       : {RECONCILIATION_WARMUP_EPOCHS}")
-print(f"Diversity warm-up            : {DIVERSITY_WARMUP_EPOCHS}")
-print(f"Phi warm-up                  : {PHI_WARMUP_EPOCHS}")
-print(f"Early stopping begins        : epoch {EARLY_STOPPING_START_EPOCH}")
-print(f"Early-stopping patience      : {EARLY_STOPPING_PATIENCE}")
-print(f"Minimum improvement          : {MINIMUM_IMPROVEMENT}")
-print(f"Maximum gradient norm        : {MAX_GRAD_NORM}")
-print(f"Checkpoint interval          : {CHECKPOINT_INTERVAL_EPOCHS}")
-print(f"Save latest every epoch      : {SAVE_LATEST_EVERY_EPOCH}")
-print(f"Train postfix interval       : {TRAIN_POSTFIX_INTERVAL}")
-print(f"Eval postfix interval        : {EVAL_POSTFIX_INTERVAL}")
+def interpolate_schedule(
+    epoch,
+    initial_value,
+    final_value,
+):
+    if NUM_EPOCHS <= 1:
+        return float(final_value)
 
-print("\n=== OBJECTIVE WEIGHT SCHEDULE CHECK ===")
+    progress = epoch / (NUM_EPOCHS - 1)
 
-schedule_check_epochs = sorted(
-    {
-        0,
-        min(1, NUM_EPOCHS - 1),
-        min(2, NUM_EPOCHS - 1),
-        min(3, NUM_EPOCHS - 1),
-        min(
-            EARLY_STOPPING_START_EPOCH - 1,
-            NUM_EPOCHS - 1,
+    return float(
+        initial_value
+        + progress
+        * (final_value - initial_value)
+    )
+
+
+def anti_collapse_schedule(epoch):
+    return {
+        "balance_weight": interpolate_schedule(
+            epoch,
+            BALANCE_WEIGHT_INITIAL,
+            BALANCE_WEIGHT_FINAL,
+        ),
+        "usage_weight": interpolate_schedule(
+            epoch,
+            USAGE_WEIGHT_INITIAL,
+            USAGE_WEIGHT_FINAL,
+        ),
+        "confidence_weight": interpolate_schedule(
+            epoch,
+            CONFIDENCE_WEIGHT_INITIAL,
+            CONFIDENCE_WEIGHT_FINAL,
+        ),
+        "temperature": interpolate_schedule(
+            epoch,
+            BALANCE_TEMPERATURE_INITIAL,
+            BALANCE_TEMPERATURE_FINAL,
         ),
     }
-)
-
-for schedule_epoch in schedule_check_epochs:
-    print(
-        f"Epoch {schedule_epoch + 1:02d}: "
-        f"{get_objective_weights(schedule_epoch)}"
-    )
 
 
 # ============================================================
-# 9. Fixed run directories
+# 7. Balanced Sinkhorn target
 # ============================================================
 
-RUN_TIMESTAMP = datetime.now().strftime(
-    "%Y%m%d_%H%M%S"
-)
-
-if RESUME_TRAINING:
-    if not RESUME_RUN_NAME:
+@torch.no_grad()
+def make_balanced_sinkhorn_target(
+    theta,
+    temperature,
+    iterations,
+):
+    if theta.ndim != 2:
         raise ValueError(
-            "RESUME_RUN_NAME must be specified."
+            f"theta must be 2D, got {theta.shape}"
         )
 
-    RUN_NAME = RESUME_RUN_NAME
+    num_documents, num_topics = theta.shape
 
-else:
-    RUN_NAME = (
-        f"depth_ot_{FEATURE_RUN_NAME}_{RUN_TIMESTAMP}"
+    if num_documents == 0:
+        raise RuntimeError("Empty theta batch.")
+
+    logits = torch.log(
+        theta.float().clamp_min(1e-8)
     )
 
-CHECKPOINT_ROOT = DIRS.get(
-    "depth_ot_checkpoints",
-    os.path.join(
-        DIRS["checkpoints"],
-        "depth_ot",
-    ),
+    logits = logits / max(
+        float(temperature),
+        1e-4,
+    )
+
+    logits = logits - logits.max(
+        dim=1,
+        keepdim=True,
+    ).values
+
+    # Topic × document
+    assignment = torch.exp(logits).t()
+    assignment = assignment.clamp_min(1e-12)
+    assignment = (
+        assignment
+        / assignment.sum().clamp_min(1e-12)
+    )
+
+    for _ in range(iterations):
+        # Topic marginal을 균등하게 설정
+        assignment = (
+            assignment
+            / assignment.sum(
+                dim=1,
+                keepdim=True,
+            ).clamp_min(1e-12)
+        )
+
+        assignment = assignment / num_topics
+
+        # Document marginal을 균등하게 설정
+        assignment = (
+            assignment
+            / assignment.sum(
+                dim=0,
+                keepdim=True,
+            ).clamp_min(1e-12)
+        )
+
+        assignment = assignment / num_documents
+
+    assignment = assignment * num_documents
+
+    return assignment.t().contiguous()
+
+
+# ============================================================
+# 8. Anti-collapse losses
+# ============================================================
+
+def calculate_anti_collapse_losses(
+    theta,
+    epoch,
+):
+    theta = theta.float()
+
+    if theta.ndim != 2:
+        raise ValueError(
+            f"Unexpected theta shape: {theta.shape}"
+        )
+
+    theta = theta.clamp_min(1e-8)
+
+    theta = theta / theta.sum(
+        dim=1,
+        keepdim=True,
+    ).clamp_min(1e-8)
+
+    schedule = anti_collapse_schedule(epoch)
+
+    balanced_target = (
+        make_balanced_sinkhorn_target(
+            theta=theta.detach(),
+            temperature=schedule["temperature"],
+            iterations=(
+                BALANCE_SINKHORN_ITERATIONS
+            ),
+        )
+    )
+
+    # Balanced pseudo-target와 theta 사이의 KL
+    balance_loss = (
+        balanced_target
+        * (
+            torch.log(
+                balanced_target.clamp_min(1e-8)
+            )
+            - torch.log(theta)
+        )
+    ).sum(dim=1).mean()
+
+    # Corpus/batch topic marginal 균형
+    topic_marginal = theta.mean(dim=0)
+
+    topic_marginal = (
+        topic_marginal
+        / topic_marginal.sum().clamp_min(1e-8)
+    )
+
+    num_topics = theta.shape[1]
+
+    usage_loss = (
+        topic_marginal
+        * torch.log(
+            topic_marginal.clamp_min(1e-8)
+            * num_topics
+        )
+    ).sum()
+
+    # 각 문서의 theta가 완전 uniform이 되는 것을 방지
+    document_entropy = -(
+        theta * torch.log(theta)
+    ).sum(dim=1).mean()
+
+    normalized_document_entropy = (
+        document_entropy
+        / math.log(max(num_topics, 2))
+    )
+
+    confidence_loss = (
+        normalized_document_entropy
+    )
+
+    regularizer = (
+        schedule["balance_weight"]
+        * balance_loss
+        + schedule["usage_weight"]
+        * usage_loss
+        + schedule["confidence_weight"]
+        * confidence_loss
+    )
+
+    return {
+        "balance": balance_loss,
+        "usage": usage_loss,
+        "confidence": confidence_loss,
+        "regularizer": regularizer,
+        "schedule": schedule,
+    }
+
+
+# ============================================================
+# 9. Run directories
+# ============================================================
+
+PROJECT_ROOT = Path(
+    getattr(
+        CONFIG,
+        "project_root",
+        "/content/drive/MyDrive/depth_ot_patent",
+    )
 )
 
-LOG_ROOT = DIRS.get(
-    "depth_ot_logs",
-    DIRS["logs"],
-)
-
-RESULT_ROOT = DIRS.get(
-    "depth_ot_results",
+CHECKPOINT_ROOT = Path(
     DIRS.get(
-        "results",
-        LOG_ROOT,
-    ),
+        "depth_ot_ckpt",
+        PROJECT_ROOT / "checkpoints" / "depth_ot",
+    )
 )
 
-RUN_CHECKPOINT_DIR = os.path.join(
-    CHECKPOINT_ROOT,
-    RUN_NAME,
+LOG_ROOT = Path(
+    DIRS.get(
+        "depth_ot_logs",
+        PROJECT_ROOT / "logs" / "depth_ot",
+    )
 )
 
-RUN_LOG_DIR = os.path.join(
-    LOG_ROOT,
-    RUN_NAME,
+RESULT_ROOT = Path(
+    DIRS.get(
+        "depth_ot_results",
+        PROJECT_ROOT / "results" / "depth_ot",
+    )
 )
 
-RUN_RESULT_DIR = os.path.join(
-    RESULT_ROOT,
-    RUN_NAME,
+RUN_CHECKPOINT_DIR = (
+    CHECKPOINT_ROOT / RUN_NAME
 )
+RUN_LOG_DIR = LOG_ROOT / RUN_NAME
+RUN_RESULT_DIR = RESULT_ROOT / RUN_NAME
 
 for directory in [
     RUN_CHECKPOINT_DIR,
     RUN_LOG_DIR,
     RUN_RESULT_DIR,
 ]:
-    os.makedirs(
-        directory,
-        exist_ok=True,
+    directory.mkdir(
+        parents=True,
+        exist_ok=False,
     )
 
-LATEST_CHECKPOINT_PATH = os.path.join(
-    RUN_CHECKPOINT_DIR,
-    "latest.pt",
+LATEST_CHECKPOINT_PATH = (
+    RUN_CHECKPOINT_DIR / "latest.pt"
+)
+BEST_CHECKPOINT_PATH = (
+    RUN_CHECKPOINT_DIR / "best.pt"
+)
+HISTORY_JSONL_PATH = (
+    RUN_LOG_DIR / "history.jsonl"
+)
+TRAINING_SUMMARY_PATH = (
+    RUN_LOG_DIR / "training_summary.json"
+)
+RUN_MANIFEST_PATH = (
+    RUN_LOG_DIR / "run_manifest.json"
+)
+ERROR_LOG_PATH = (
+    RUN_LOG_DIR / "training_error.txt"
+)
+LEARNED_ANCHOR_PATH = (
+    RUN_RESULT_DIR / "learned_anchor.pt"
 )
 
-BEST_CHECKPOINT_PATH = os.path.join(
-    RUN_CHECKPOINT_DIR,
-    "best.pt",
-)
 
-HISTORY_JSONL_PATH = os.path.join(
-    RUN_LOG_DIR,
-    "history.jsonl",
-)
+# Section 7 호환을 위해 문자열로 유지
+RUN_CHECKPOINT_DIR = str(RUN_CHECKPOINT_DIR)
+RUN_LOG_DIR = str(RUN_LOG_DIR)
+RUN_RESULT_DIR = str(RUN_RESULT_DIR)
 
-TRAINING_SUMMARY_PATH = os.path.join(
-    RUN_LOG_DIR,
-    "training_summary.json",
+LATEST_CHECKPOINT_PATH = str(
+    LATEST_CHECKPOINT_PATH
 )
-
-RUN_MANIFEST_PATH = os.path.join(
-    RUN_LOG_DIR,
-    "run_manifest.json",
+BEST_CHECKPOINT_PATH = str(
+    BEST_CHECKPOINT_PATH
 )
-
-RESUME_MANIFEST_PATH = os.path.join(
-    RUN_LOG_DIR,
-    "resume_execution_manifest.json",
+HISTORY_JSONL_PATH = str(
+    HISTORY_JSONL_PATH
 )
-
-ERROR_LOG_PATH = os.path.join(
-    RUN_LOG_DIR,
-    "training_error.txt",
+TRAINING_SUMMARY_PATH = str(
+    TRAINING_SUMMARY_PATH
 )
-
-LEARNED_ANCHOR_PATH = os.path.join(
-    RUN_RESULT_DIR,
-    "learned_anchor.pt",
+RUN_MANIFEST_PATH = str(
+    RUN_MANIFEST_PATH
 )
-
-print("\n=== RUN DIRECTORIES ===")
-print(f"Run name       : {RUN_NAME}")
-print(f"Checkpoint dir : {RUN_CHECKPOINT_DIR}")
-print(f"Log dir        : {RUN_LOG_DIR}")
-print(f"Result dir     : {RUN_RESULT_DIR}")
+ERROR_LOG_PATH = str(
+    ERROR_LOG_PATH
+)
+LEARNED_ANCHOR_PATH = str(
+    LEARNED_ANCHOR_PATH
+)
 
 
 # ============================================================
-# 10. Verify resume checkpoint
-# ============================================================
-
-if RESUME_TRAINING:
-    print("\n=== RESUME CHECK ===")
-    print(
-        f"Expected checkpoint:\n"
-        f"  {LATEST_CHECKPOINT_PATH}"
-    )
-    print(
-        f"Exists: "
-        f"{os.path.isfile(LATEST_CHECKPOINT_PATH)}"
-    )
-
-    if not os.path.isfile(
-        LATEST_CHECKPOINT_PATH
-    ):
-        available_checkpoints = []
-
-        if os.path.isdir(
-            CHECKPOINT_ROOT
-        ):
-            for candidate_run in sorted(
-                os.listdir(
-                    CHECKPOINT_ROOT
-                )
-            ):
-                candidate_latest = os.path.join(
-                    CHECKPOINT_ROOT,
-                    candidate_run,
-                    "latest.pt",
-                )
-
-                if os.path.isfile(
-                    candidate_latest
-                ):
-                    available_checkpoints.append(
-                        candidate_latest
-                    )
-
-        if not ALLOW_NEW_RUN_IF_CHECKPOINT_MISSING:
-            raise FileNotFoundError(
-                "Resume checkpoint를 찾지 못했습니다.\n"
-                f"Expected:\n"
-                f"{LATEST_CHECKPOINT_PATH}\n\n"
-                "Available checkpoints:\n"
-                + "\n".join(
-                    available_checkpoints[-20:]
-                )
-            )
-
-        print(
-            "[WARNING] Checkpoint missing. "
-            "Starting a new run."
-        )
-
-        RESUME_TRAINING = False
-
-
-# ============================================================
-# 11. Serialization utilities
+# 10. Serialization utilities
 # ============================================================
 
 def config_to_dictionary(config):
     if is_dataclass(config):
         return asdict(config)
 
-    if isinstance(
-        config,
-        dict,
-    ):
+    if isinstance(config, dict):
         return dict(config)
 
     result = {}
@@ -11109,10 +11187,7 @@ def config_to_dictionary(config):
             continue
 
         try:
-            value = getattr(
-                config,
-                key,
-            )
+            value = getattr(config, key)
         except Exception:
             continue
 
@@ -11137,30 +11212,8 @@ def config_to_dictionary(config):
     return result
 
 
-def atomic_json_save_local(
-    data,
-    final_path,
-):
-    directory = os.path.dirname(
-        final_path
-    )
-
-    if directory:
-        os.makedirs(
-            directory,
-            exist_ok=True,
-        )
-
-    temporary_path = (
-        final_path + ".tmp"
-    )
-
-    if os.path.exists(
-        temporary_path
-    ):
-        os.remove(
-            temporary_path
-        )
+def atomic_json_save(data, path):
+    temporary_path = path + ".tmp"
 
     with open(
         temporary_path,
@@ -11175,28 +11228,13 @@ def atomic_json_save_local(
             default=str,
         )
 
-        file.flush()
-
     os.replace(
         temporary_path,
-        final_path,
+        path,
     )
 
 
-def append_jsonl(
-    data,
-    path,
-):
-    directory = os.path.dirname(
-        path
-    )
-
-    if directory:
-        os.makedirs(
-            directory,
-            exist_ok=True,
-        )
-
+def append_jsonl(data, path):
     with open(
         path,
         "a",
@@ -11211,33 +11249,9 @@ def append_jsonl(
             + "\n"
         )
 
-        file.flush()
 
-
-def atomic_torch_save(
-    data,
-    final_path,
-):
-    directory = os.path.dirname(
-        final_path
-    )
-
-    if directory:
-        os.makedirs(
-            directory,
-            exist_ok=True,
-        )
-
-    temporary_path = (
-        final_path + ".tmp"
-    )
-
-    if os.path.exists(
-        temporary_path
-    ):
-        os.remove(
-            temporary_path
-        )
+def atomic_torch_save(data, path):
+    temporary_path = path + ".tmp"
 
     torch.save(
         data,
@@ -11246,7 +11260,7 @@ def atomic_torch_save(
 
     os.replace(
         temporary_path,
-        final_path,
+        path,
     )
 
 
@@ -11260,7 +11274,6 @@ def safe_torch_load(
             map_location=map_location,
             weights_only=False,
         )
-
     except TypeError:
         return torch.load(
             path,
@@ -11269,403 +11282,26 @@ def safe_torch_load(
 
 
 # ============================================================
-# 12. RNG utilities — CPU ByteTensor fix
+# 11. Optimizer utility
 # ============================================================
 
-def _to_cpu_byte_tensor(
-    state_tensor,
+def optimizer_to_device(
+    optimizer,
+    target_device,
 ):
-    """
-    torch RNG state는 반드시 CPU ByteTensor여야 합니다.
-    """
-
-    if torch.is_tensor(
-        state_tensor
-    ):
-        return (
-            state_tensor
-            .detach()
-            .to(
-                device="cpu",
-                dtype=torch.uint8,
-            )
-            .contiguous()
-        )
-
-    return torch.as_tensor(
-        state_tensor,
-        dtype=torch.uint8,
-        device="cpu",
-    ).contiguous()
-
-
-def capture_rng_state():
-    state = {
-        "python": random.getstate(),
-        "numpy": np.random.get_state(),
-        "torch_cpu": torch.get_rng_state(),
-    }
-
-    if torch.cuda.is_available():
-        state["torch_cuda"] = (
-            torch.cuda.get_rng_state_all()
-        )
-    else:
-        state["torch_cuda"] = None
-
-    if "loader_generator" in globals():
-        state["loader_generator"] = (
-            loader_generator.get_state()
-        )
-
-    return state
-
-
-def restore_rng_state(state):
-    if not state:
-        return
-
-    # Python RNG
-    if state.get(
-        "python"
-    ) is not None:
-        random.setstate(
-            state["python"]
-        )
-
-    # NumPy RNG
-    if state.get(
-        "numpy"
-    ) is not None:
-        np.random.set_state(
-            state["numpy"]
-        )
-
-    # PyTorch CPU RNG
-    if state.get(
-        "torch_cpu"
-    ) is not None:
-        torch_cpu_state = (
-            _to_cpu_byte_tensor(
-                state["torch_cpu"]
-            )
-        )
-
-        torch.set_rng_state(
-            torch_cpu_state
-        )
-
-    # PyTorch CUDA RNG
-    if (
-        torch.cuda.is_available()
-        and state.get(
-            "torch_cuda"
-        ) is not None
-    ):
-        cuda_states = state[
-            "torch_cuda"
-        ]
-
-        if torch.is_tensor(
-            cuda_states
-        ):
-            cuda_states = [
-                cuda_states
-            ]
-
-        converted_cuda_states = [
-            _to_cpu_byte_tensor(
-                cuda_state
-            )
-            for cuda_state in cuda_states
-        ]
-
-        if (
-            len(converted_cuda_states)
-            == torch.cuda.device_count()
-        ):
-            torch.cuda.set_rng_state_all(
-                converted_cuda_states
-            )
-
-        elif converted_cuda_states:
-            torch.cuda.set_rng_state(
-                converted_cuda_states[0],
-                device=DEVICE,
-            )
-
-    # DataLoader generator
-    if (
-        "loader_generator" in globals()
-        and state.get(
-            "loader_generator"
-        ) is not None
-    ):
-        loader_state = (
-            _to_cpu_byte_tensor(
-                state["loader_generator"]
-            )
-        )
-
-        loader_generator.set_state(
-            loader_state
-        )
-
-
-# ============================================================
-# 13. Checkpoint utilities
-# ============================================================
-
-def build_checkpoint(
-    epoch,
-    best_validation_loss,
-    epochs_without_improvement,
-    history,
-):
-    return {
-        "run_name": RUN_NAME,
-        "feature_run_name": FEATURE_RUN_NAME,
-        "epoch": int(epoch),
-        "epoch_one_based": int(epoch) + 1,
-
-        "model_state_dict": (
-            depth_ot_model.state_dict()
-        ),
-
-        "topic_anchor_state_dict": (
-            topic_anchor.state_dict()
-        ),
-
-        "main_optimizer_state_dict": (
-            main_optimizer.state_dict()
-        ),
-
-        "phi_optimizer_state_dict": (
-            phi_optimizer.state_dict()
-        ),
-
-        "best_validation_loss": float(
-            best_validation_loss
-        ),
-
-        "epochs_without_improvement": int(
-            epochs_without_improvement
-        ),
-
-        "history": history,
-
-        "config": config_to_dictionary(
-            CONFIG
-        ),
-
-        "training_settings": {
-            "num_epochs": NUM_EPOCHS,
-            "early_stopping_patience": (
-                EARLY_STOPPING_PATIENCE
-            ),
-            "early_stopping_start_epoch": (
-                EARLY_STOPPING_START_EPOCH
-            ),
-            "minimum_improvement": (
-                MINIMUM_IMPROVEMENT
-            ),
-            "max_grad_norm": (
-                MAX_GRAD_NORM
-            ),
-            "checkpoint_interval_epochs": (
-                CHECKPOINT_INTERVAL_EPOCHS
-            ),
-            "kl_warmup_epochs": (
-                KL_WARMUP_EPOCHS
-            ),
-            "hierarchy_warmup_epochs": (
-                HIERARCHY_WARMUP_EPOCHS
-            ),
-            "reconciliation_warmup_epochs": (
-                RECONCILIATION_WARMUP_EPOCHS
-            ),
-            "diversity_warmup_epochs": (
-                DIVERSITY_WARMUP_EPOCHS
-            ),
-            "phi_warmup_epochs": (
-                PHI_WARMUP_EPOCHS
-            ),
-            "patents_per_batch": (
-                configured_patents_per_batch
-            ),
-        },
-
-        "rng_state": capture_rng_state(),
-        "saved_at": datetime.now().isoformat(),
-    }
-
-
-def save_checkpoint(
-    path,
-    epoch,
-    best_validation_loss,
-    epochs_without_improvement,
-    history,
-):
-    checkpoint = build_checkpoint(
-        epoch=epoch,
-        best_validation_loss=(
-            best_validation_loss
-        ),
-        epochs_without_improvement=(
-            epochs_without_improvement
-        ),
-        history=history,
-    )
-
-    atomic_torch_save(
-        checkpoint,
-        path,
-    )
-
-
-def periodic_checkpoint_path(
-    epoch_one_based,
-):
-    return os.path.join(
-        RUN_CHECKPOINT_DIR,
-        f"epoch_{epoch_one_based:03d}.pt",
-    )
-
-
-def load_checkpoint(
-    path,
-    restore_optimizers=True,
-    restore_rng=True,
-):
-    if not os.path.isfile(
-        path
-    ):
-        raise FileNotFoundError(
-            f"Checkpoint not found: {path}"
-        )
-
-    # 중요:
-    # RNG state가 CUDA tensor로 변환되지 않도록
-    # checkpoint 전체를 먼저 CPU에 로드합니다.
-    checkpoint = safe_torch_load(
-        path,
-        map_location="cpu",
-    )
-
-    checkpoint_feature_run = (
-        checkpoint.get(
-            "feature_run_name"
-        )
-    )
-
-    if (
-        checkpoint_feature_run is not None
-        and checkpoint_feature_run
-        != FEATURE_RUN_NAME
-    ):
-        raise ValueError(
-            "Checkpoint feature-run mismatch: "
-            f"checkpoint={checkpoint_feature_run}, "
-            f"current={FEATURE_RUN_NAME}"
-        )
-
-    checkpoint_settings = checkpoint.get(
-        "training_settings",
-        {},
-    )
-
-    checkpoint_batch_size = (
-        checkpoint_settings.get(
-            "patents_per_batch"
-        )
-    )
-
-    if (
-        checkpoint_batch_size is not None
-        and configured_patents_per_batch is not None
-        and int(checkpoint_batch_size)
-        != int(configured_patents_per_batch)
-    ):
-        raise ValueError(
-            "Checkpoint patents_per_batch mismatch: "
-            f"checkpoint={checkpoint_batch_size}, "
-            f"current={configured_patents_per_batch}"
-        )
-
-    depth_ot_model.load_state_dict(
-        checkpoint["model_state_dict"]
-    )
-
-    topic_anchor.load_state_dict(
-        checkpoint[
-            "topic_anchor_state_dict"
-        ]
-    )
-
-    depth_ot_model.to(
-        DEVICE
-    )
-
-    topic_anchor.to(
-        DEVICE
-    )
-
-    if restore_optimizers:
-        main_optimizer.load_state_dict(
-            checkpoint[
-                "main_optimizer_state_dict"
-            ]
-        )
-
-        phi_optimizer.load_state_dict(
-            checkpoint[
-                "phi_optimizer_state_dict"
-            ]
-        )
-
-        optimizer_to_device(
-            main_optimizer,
-            DEVICE,
-        )
-
-        optimizer_to_device(
-            phi_optimizer,
-            DEVICE,
-        )
-
-    if restore_rng:
-        try:
-            restore_rng_state(
-                checkpoint.get(
-                    "rng_state"
+    for optimizer_state in optimizer.state.values():
+        for key, value in optimizer_state.items():
+            if torch.is_tensor(value):
+                optimizer_state[key] = value.to(
+                    target_device
                 )
-            )
-
-            print(
-                "[PASS] RNG state restored."
-            )
-
-        except Exception as error:
-            # RNG 복원 실패 때문에 학습 전체가 중단되지 않게 함
-            print(
-                "[WARNING] RNG state could not be "
-                f"fully restored: {error}"
-            )
-            print(
-                "Model and optimizer were restored; "
-                "training will continue."
-            )
-
-    return checkpoint
 
 
 # ============================================================
-# 14. Metric accumulator
+# 12. Metrics
 # ============================================================
 
-LOSS_NAMES = [
-    "total",
+BASE_LOSS_NAMES = [
     "reconstruction",
     "kl",
     "hierarchy",
@@ -11674,84 +11310,99 @@ LOSS_NAMES = [
 ]
 
 
-class EpochMetricAccumulator:
-    def __init__(self):
-        self.loss_sums = None
+class MetricAccumulator:
+    def __init__(self, num_topics):
+        self.num_topics = int(num_topics)
 
         self.num_batches = 0
         self.num_patents = 0
         self.num_claims = 0
-        self.num_edges = 0
+
+        self.loss_sums = {
+            "total": 0.0,
+            "base_total": 0.0,
+            "reconstruction": 0.0,
+            "kl": 0.0,
+            "hierarchy": 0.0,
+            "reconciliation": 0.0,
+            "diversity": 0.0,
+            "balance": 0.0,
+            "usage": 0.0,
+            "confidence": 0.0,
+            "regularizer": 0.0,
+        }
+
+        self.topic_counts = torch.zeros(
+            self.num_topics,
+            dtype=torch.long,
+        )
 
         self.gradient_norm_sum = 0.0
-
         self.phi_update_count = 0
-        self.phi_loss_sum = 0.0
-        self.phi_gap_loss_sum = 0.0
-
         self.maximum_sinkhorn_error = 0.0
-        self.failed_sinkhorn_transitions = 0
 
     def update(
         self,
         losses,
+        regularizers,
+        theta,
         batch,
         gradient_norm=None,
         phi_info=None,
         ot_output=None,
     ):
-        for name in LOSS_NAMES:
-            if name not in losses:
-                raise KeyError(
-                    f"Missing loss '{name}'."
+        values = {
+            "total": losses["total"],
+            "base_total": losses["base_total"],
+            "reconstruction": losses[
+                "reconstruction"
+            ],
+            "kl": losses["kl"],
+            "hierarchy": losses["hierarchy"],
+            "reconciliation": losses[
+                "reconciliation"
+            ],
+            "diversity": losses["diversity"],
+            "balance": regularizers["balance"],
+            "usage": regularizers["usage"],
+            "confidence": regularizers[
+                "confidence"
+            ],
+            "regularizer": regularizers[
+                "regularizer"
+            ],
+        }
+
+        for name, value in values.items():
+            scalar = float(
+                value.detach().float().item()
+            )
+
+            if not math.isfinite(scalar):
+                raise FloatingPointError(
+                    f"Non-finite metric: "
+                    f"{name}={scalar}"
                 )
 
-        loss_vector = torch.stack(
-            [
-                losses[name]
-                .detach()
-                .float()
-                .reshape(())
-                for name in LOSS_NAMES
-            ]
+            self.loss_sums[name] += scalar
+
+        predictions = (
+            theta.detach()
+            .argmax(dim=1)
+            .cpu()
         )
 
-        if not torch.isfinite(
-            loss_vector
-        ).all():
-            diagnostics = {
-                name: value
-                for name, value in zip(
-                    LOSS_NAMES,
-                    loss_vector.cpu().tolist(),
-                )
-            }
-
-            raise FloatingPointError(
-                f"Non-finite loss: {diagnostics}"
-            )
-
-        if self.loss_sums is None:
-            self.loss_sums = (
-                loss_vector.clone()
-            )
-        else:
-            self.loss_sums.add_(
-                loss_vector
-            )
+        self.topic_counts += torch.bincount(
+            predictions,
+            minlength=self.num_topics,
+        )
 
         self.num_batches += 1
-
         self.num_patents += int(
             batch["num_patents"]
         )
-
         self.num_claims += int(
             batch["num_claims"]
-        )
-
-        self.num_edges += int(
-            batch["claim_edge_index"].shape[1]
         )
 
         if gradient_norm is not None:
@@ -11761,56 +11412,35 @@ class EpochMetricAccumulator:
 
         if (
             phi_info is not None
-            and phi_info.get(
-                "updated",
-                False,
-            )
+            and phi_info.get("updated", False)
         ):
             self.phi_update_count += 1
 
-            self.phi_loss_sum += float(
-                phi_info["phi_loss"]
-            )
-
-            self.phi_gap_loss_sum += float(
-                phi_info["gap_loss"]
-            )
-
         if (
-            ot_output is not None
+            isinstance(ot_output, dict)
             and ot_output.get(
                 "sinkhorn_diagnostics"
             ) is not None
         ):
-            for info in ot_output[
+            diagnostics = ot_output[
                 "sinkhorn_diagnostics"
-            ].values():
-                maximum_error = info[
-                    "maximum_marginal_error"
-                ]
+            ]
 
-                if torch.is_tensor(
-                    maximum_error
-                ):
-                    maximum_error = float(
-                        maximum_error
-                        .detach()
-                        .cpu()
-                    )
-                else:
-                    maximum_error = float(
-                        maximum_error
+            for info in diagnostics.values():
+                error = info.get(
+                    "maximum_marginal_error",
+                    0.0,
+                )
+
+                if torch.is_tensor(error):
+                    error = float(
+                        error.detach().cpu()
                     )
 
                 self.maximum_sinkhorn_error = max(
                     self.maximum_sinkhorn_error,
-                    maximum_error,
+                    float(error),
                 )
-
-                if not bool(
-                    info["converged"]
-                ):
-                    self.failed_sinkhorn_transitions += 1
 
     def compute(self):
         if self.num_batches == 0:
@@ -11818,109 +11448,165 @@ class EpochMetricAccumulator:
                 "No batches were accumulated."
             )
 
-        mean_loss_vector = (
-            self.loss_sums
-            / self.num_batches
-        )
-
-        mean_loss_values = (
-            mean_loss_vector
-            .detach()
-            .cpu()
-            .tolist()
-        )
-
         metrics = {
-            name: float(value)
-            for name, value in zip(
-                LOSS_NAMES,
-                mean_loss_values,
-            )
+            name: value / self.num_batches
+            for name, value
+            in self.loss_sums.items()
         }
 
-        metrics.update(
-            {
-                "num_batches": int(
-                    self.num_batches
-                ),
-
-                "num_patents": int(
-                    self.num_patents
-                ),
-
-                "num_claims": int(
-                    self.num_claims
-                ),
-
-                "num_edges": int(
-                    self.num_edges
-                ),
-
-                "mean_gradient_norm": float(
-                    self.gradient_norm_sum
-                    / self.num_batches
-                ),
-
-                "phi_updates": int(
-                    self.phi_update_count
-                ),
-
-                "mean_phi_loss": (
-                    self.phi_loss_sum
-                    / self.phi_update_count
-                    if self.phi_update_count > 0
-                    else None
-                ),
-
-                "mean_phi_gap_loss": (
-                    self.phi_gap_loss_sum
-                    / self.phi_update_count
-                    if self.phi_update_count > 0
-                    else None
-                ),
-
-                "maximum_sinkhorn_error": float(
-                    self.maximum_sinkhorn_error
-                ),
-
-                "failed_sinkhorn_transitions": int(
-                    self.failed_sinkhorn_transitions
-                ),
-            }
+        total_assignments = int(
+            self.topic_counts.sum().item()
         )
+
+        active_topics = int(
+            (self.topic_counts > 0)
+            .sum()
+            .item()
+        )
+
+        maximum_topic_share = float(
+            self.topic_counts.max().item()
+            / max(total_assignments, 1)
+        )
+
+        marginal = (
+            self.topic_counts.float()
+            / max(total_assignments, 1)
+        )
+
+        positive = marginal > 0
+
+        marginal_entropy = float(
+            -(
+                marginal[positive]
+                * torch.log(marginal[positive])
+            ).sum().item()
+            / math.log(max(self.num_topics, 2))
+        )
+
+        metrics.update({
+            "num_batches": int(
+                self.num_batches
+            ),
+            "num_patents": int(
+                self.num_patents
+            ),
+            "num_claims": int(
+                self.num_claims
+            ),
+            "active_topics": active_topics,
+            "maximum_topic_share": (
+                maximum_topic_share
+            ),
+            "normalized_marginal_entropy": (
+                marginal_entropy
+            ),
+            "topic_counts": (
+                self.topic_counts.tolist()
+            ),
+            "mean_gradient_norm": (
+                self.gradient_norm_sum
+                / max(self.num_batches, 1)
+            ),
+            "phi_updates": int(
+                self.phi_update_count
+            ),
+            "maximum_sinkhorn_error": float(
+                self.maximum_sinkhorn_error
+            ),
+        })
 
         return metrics
 
 
 # ============================================================
-# 15. Train one epoch
+# 13. Model objective
+# ============================================================
+
+def should_compute_hierarchy(epoch):
+    return (
+        epoch + 1 > HIERARCHY_START_EPOCH
+    )
+
+
+def compute_objective(
+    batch,
+    epoch,
+    deterministic,
+):
+    hierarchy_enabled = (
+        should_compute_hierarchy(epoch)
+    )
+
+    output = depth_ot_model.compute_loss(
+        batch=batch,
+        epoch=epoch,
+        deterministic=deterministic,
+        compute_hierarchy=hierarchy_enabled,
+    )
+
+    losses = output["losses"]
+    theta = output["outputs"]["theta"]
+
+    regularizers = (
+        calculate_anti_collapse_losses(
+            theta=theta,
+            epoch=epoch,
+        )
+    )
+
+    base_total = losses["total"]
+    final_total = (
+        base_total
+        + regularizers["regularizer"]
+    )
+
+    losses["base_total"] = base_total
+    losses["total"] = final_total
+
+    # compute_hierarchy=False인 경우에도
+    # MetricAccumulator가 요구하는 키를 보장
+    reference_tensor = final_total
+
+    for name in BASE_LOSS_NAMES:
+        if name not in losses:
+            losses[name] = (
+                reference_tensor
+                * 0.0
+            )
+
+    return (
+        output,
+        losses,
+        regularizers,
+        theta,
+    )
+
+
+# ============================================================
+# 14. Train one epoch
 # ============================================================
 
 def train_one_epoch(epoch):
     depth_ot_model.train()
     topic_anchor.train()
 
-    if (
-        hasattr(
-            train_loader,
-            "batch_sampler",
-        )
-        and hasattr(
-            train_loader.batch_sampler,
-            "set_epoch",
-        )
-    ):
-        train_loader.batch_sampler.set_epoch(
-            epoch
-        )
+    batch_sampler = getattr(
+        train_loader,
+        "batch_sampler",
+        None,
+    )
 
-    accumulator = (
-        EpochMetricAccumulator()
+    if hasattr(batch_sampler, "set_epoch"):
+        batch_sampler.set_epoch(epoch)
+
+    accumulator = MetricAccumulator(
+        num_topics=CONFIG.num_topics
     )
 
     torch.cuda.reset_peak_memory_stats()
 
-    epoch_start = time.time()
+    start_time = time.time()
 
     progress = tqdm(
         train_loader,
@@ -11945,23 +11631,24 @@ def train_one_epoch(epoch):
             set_to_none=True
         )
 
-        output = depth_ot_model.compute_loss(
+        (
+            output,
+            losses,
+            regularizers,
+            theta,
+        ) = compute_objective(
             batch=batch,
             epoch=epoch,
             deterministic=False,
-            compute_hierarchy=True,
         )
 
-        losses = output["losses"]
         total_loss = losses["total"]
 
-        if not torch.isfinite(
-            total_loss
-        ):
+        if not torch.isfinite(total_loss):
             raise FloatingPointError(
-                "Non-finite training loss at "
+                f"Non-finite training loss: "
                 f"epoch={epoch + 1}, "
-                f"batch={batch_index}."
+                f"batch={batch_index}"
             )
 
         total_loss.backward()
@@ -11973,8 +11660,8 @@ def train_one_epoch(epoch):
             )
         ):
             raise RuntimeError(
-                "Phi received gradient during "
-                "main-model backward pass."
+                "topic_anchor.phi received gradients "
+                "during main-model backward."
             )
 
         gradient_norm = (
@@ -11984,45 +11671,41 @@ def train_one_epoch(epoch):
             )
         )
 
-        gradient_norm_value = float(
+        gradient_norm = float(
             torch.as_tensor(
                 gradient_norm
             ).detach().item()
         )
 
-        if not math.isfinite(
-            gradient_norm_value
-        ):
+        if not math.isfinite(gradient_norm):
             raise FloatingPointError(
-                "Non-finite main gradient norm."
+                "Non-finite gradient norm."
             )
 
         main_optimizer.step()
 
-        phi_info = update_phi(
-            theta=output[
-                "outputs"
-            ]["theta"].detach(),
-
-            claim_depth=batch[
-                "claim_depth"
-            ],
-
-            claim_edge_index=batch[
-                "claim_edge_index"
-            ],
-
-            epoch=epoch,
-        )
+        if epoch + 1 > PHI_START_EPOCH:
+            phi_info = update_phi(
+                theta=theta.detach(),
+                claim_depth=batch["claim_depth"],
+                claim_edge_index=batch[
+                    "claim_edge_index"
+                ],
+                epoch=epoch,
+            )
+        else:
+            phi_info = {
+                "updated": False
+            }
 
         accumulator.update(
             losses=losses,
+            regularizers=regularizers,
+            theta=theta,
             batch=batch,
-            gradient_norm=gradient_norm_value,
+            gradient_norm=gradient_norm,
             phi_info=phi_info,
-            ot_output=output[
-                "ot_output"
-            ],
+            ot_output=output.get("ot_output"),
         )
 
         if (
@@ -12032,61 +11715,42 @@ def train_one_epoch(epoch):
             or batch_index + 1
             == len(train_loader)
         ):
-            progress.set_postfix(
-                {
-                    "loss": (
-                        f"{total_loss.detach().item():.4f}"
-                    ),
-                    "rec": (
-                        f"{losses['reconstruction'].detach().item():.4f}"
-                    ),
-                    "hier": (
-                        f"{losses['hierarchy'].detach().item():.4f}"
-                    ),
-                    "phi": (
-                        "on"
-                        if phi_info.get(
-                            "updated",
-                            False,
-                        )
-                        else "off"
-                    ),
-                },
-                refresh=False,
-            )
+            progress.set_postfix({
+                "loss": (
+                    f"{total_loss.detach().item():.4f}"
+                ),
+                "bal": (
+                    f"{regularizers['balance'].detach().item():.3f}"
+                ),
+                "use": (
+                    f"{regularizers['usage'].detach().item():.3f}"
+                ),
+                "hier": (
+                    "on"
+                    if should_compute_hierarchy(epoch)
+                    else "off"
+                ),
+            }, refresh=False)
 
         del cpu_batch
         del batch
         del output
         del losses
+        del regularizers
+        del theta
         del total_loss
         del phi_info
 
-    epoch_seconds = (
-        time.time()
-        - epoch_start
-    )
-
+    elapsed = time.time() - start_time
     metrics = accumulator.compute()
 
     metrics["epoch_seconds"] = float(
-        epoch_seconds
-    )
-
-    metrics["batches_per_second"] = float(
-        metrics["num_batches"]
-        / max(
-            epoch_seconds,
-            1e-9,
-        )
+        elapsed
     )
 
     metrics["patents_per_second"] = float(
         metrics["num_patents"]
-        / max(
-            epoch_seconds,
-            1e-9,
-        )
+        / max(elapsed, 1e-9)
     )
 
     metrics["peak_gpu_gib"] = float(
@@ -12094,16 +11758,15 @@ def train_one_epoch(epoch):
         / 2**30
     )
 
-    metrics["peak_reserved_gib"] = float(
-        torch.cuda.max_memory_reserved()
-        / 2**30
+    metrics["hierarchy_computed"] = bool(
+        should_compute_hierarchy(epoch)
     )
 
     return metrics
 
 
 # ============================================================
-# 16. Evaluate one epoch
+# 15. Evaluate
 # ============================================================
 
 @torch.inference_mode()
@@ -12111,12 +11774,13 @@ def evaluate_one_epoch(
     data_loader,
     epoch,
     description,
+    maximum_batches=None,
 ):
     depth_ot_model.eval()
     topic_anchor.eval()
 
-    accumulator = (
-        EpochMetricAccumulator()
+    accumulator = MetricAccumulator(
+        num_topics=CONFIG.num_topics
     )
 
     progress = tqdm(
@@ -12129,628 +11793,584 @@ def evaluate_one_epoch(
     for batch_index, cpu_batch in enumerate(
         progress
     ):
+        if (
+            maximum_batches is not None
+            and batch_index >= maximum_batches
+        ):
+            break
+
         batch = move_depth_ot_batch(
             cpu_batch,
             device=DEVICE,
         )
 
-        output = depth_ot_model.compute_loss(
+        (
+            output,
+            losses,
+            regularizers,
+            theta,
+        ) = compute_objective(
             batch=batch,
             epoch=epoch,
             deterministic=True,
-            compute_hierarchy=True,
         )
-
-        losses = output["losses"]
 
         if not torch.isfinite(
             losses["total"]
         ):
             raise FloatingPointError(
-                f"Non-finite evaluation loss "
-                f"in {description}, "
-                f"batch={batch_index}."
+                f"Non-finite evaluation loss: "
+                f"{description}, "
+                f"batch={batch_index}"
             )
 
         accumulator.update(
             losses=losses,
+            regularizers=regularizers,
+            theta=theta,
             batch=batch,
             gradient_norm=None,
             phi_info=None,
-            ot_output=output[
-                "ot_output"
-            ],
+            ot_output=output.get("ot_output"),
         )
 
         if (
             batch_index
             % EVAL_POSTFIX_INTERVAL
             == 0
-            or batch_index + 1
-            == len(data_loader)
         ):
-            progress.set_postfix(
-                {
-                    "loss": (
-                        f"{losses['total'].detach().item():.4f}"
-                    )
-                },
-                refresh=False,
-            )
+            progress.set_postfix({
+                "loss": (
+                    f"{losses['total'].item():.4f}"
+                )
+            }, refresh=False)
 
         del cpu_batch
         del batch
         del output
         del losses
+        del regularizers
+        del theta
 
     return accumulator.compute()
 
 
 # ============================================================
-# 17. Run manifest
+# 16. Checkpoint selection
+# ============================================================
+
+def build_selection_record(
+    dev_metrics,
+):
+    eligible = (
+        dev_metrics["active_topics"]
+        >= MIN_ACTIVE_TOPICS
+        and dev_metrics["maximum_topic_share"]
+        <= MAX_TOPIC_SHARE
+        and dev_metrics[
+            "normalized_marginal_entropy"
+        ]
+        >= MIN_MARGINAL_ENTROPY
+    )
+
+    return {
+        "eligible": bool(eligible),
+        "active_topics": int(
+            dev_metrics["active_topics"]
+        ),
+        "maximum_topic_share": float(
+            dev_metrics["maximum_topic_share"]
+        ),
+        "marginal_entropy": float(
+            dev_metrics[
+                "normalized_marginal_entropy"
+            ]
+        ),
+        "dev_total": float(
+            dev_metrics["total"]
+        ),
+    }
+
+
+def selection_score(selection):
+    return (
+        2.0 * selection["active_topics"]
+        + 10.0 * selection["marginal_entropy"]
+        - 20.0 * selection[
+            "maximum_topic_share"
+        ]
+    )
+
+
+def candidate_is_better(
+    candidate,
+    best_selection,
+):
+    if best_selection is None:
+        return True
+
+    if (
+        candidate["eligible"]
+        != best_selection["eligible"]
+    ):
+        return candidate["eligible"]
+
+    if candidate["eligible"]:
+        return (
+            candidate["dev_total"]
+            < best_selection["dev_total"]
+            - MINIMUM_IMPROVEMENT
+        )
+
+    return (
+        selection_score(candidate)
+        > selection_score(best_selection)
+    )
+
+
+# ============================================================
+# 17. Checkpoint utilities
+# ============================================================
+
+def build_checkpoint(
+    epoch,
+    history,
+    best_selection,
+):
+    return {
+        "run_name": RUN_NAME,
+        "feature_run_name": FEATURE_RUN_NAME,
+        "epoch": int(epoch),
+        "epoch_one_based": int(epoch + 1),
+        "model_state_dict": (
+            depth_ot_model.state_dict()
+        ),
+        "topic_anchor_state_dict": (
+            topic_anchor.state_dict()
+        ),
+        "main_optimizer_state_dict": (
+            main_optimizer.state_dict()
+        ),
+        "phi_optimizer_state_dict": (
+            phi_optimizer.state_dict()
+        ),
+        "history": history,
+        "best_selection": best_selection,
+        "best_validation_loss": (
+            None
+            if best_selection is None
+            else best_selection["dev_total"]
+        ),
+        "config": config_to_dictionary(
+            CONFIG
+        ),
+        "training_settings": {
+            "fresh_run": True,
+            "resume": False,
+            "seed": SEED,
+            "num_epochs": NUM_EPOCHS,
+            "patents_per_batch": (
+                PATENTS_PER_BATCH
+            ),
+            "anti_collapse": True,
+            "balance_weight_initial": (
+                BALANCE_WEIGHT_INITIAL
+            ),
+            "balance_weight_final": (
+                BALANCE_WEIGHT_FINAL
+            ),
+            "usage_weight_initial": (
+                USAGE_WEIGHT_INITIAL
+            ),
+            "usage_weight_final": (
+                USAGE_WEIGHT_FINAL
+            ),
+            "kl_max_weight": KL_MAX_WEIGHT,
+            "hierarchy_max_weight": (
+                HIERARCHY_MAX_WEIGHT
+            ),
+            "minimum_active_topics": (
+                MIN_ACTIVE_TOPICS
+            ),
+            "maximum_topic_share": (
+                MAX_TOPIC_SHARE
+            ),
+            "minimum_marginal_entropy": (
+                MIN_MARGINAL_ENTROPY
+            ),
+        },
+        "saved_at": (
+            datetime.now().isoformat()
+        ),
+    }
+
+
+def save_checkpoint(
+    path,
+    epoch,
+    history,
+    best_selection,
+):
+    checkpoint = build_checkpoint(
+        epoch=epoch,
+        history=history,
+        best_selection=best_selection,
+    )
+
+    atomic_torch_save(
+        checkpoint,
+        path,
+    )
+
+
+# ============================================================
+# 18. Manifest and configuration report
 # ============================================================
 
 run_manifest = {
     "run_name": RUN_NAME,
-    "execution_started_at": (
-        datetime.now().isoformat()
-    ),
-    "resumed": RESUME_TRAINING,
     "feature_run_name": FEATURE_RUN_NAME,
-    "device": str(DEVICE),
+    "started_at": datetime.now().isoformat(),
+    "fresh_training": True,
+    "resume": False,
+    "seed": SEED,
     "gpu": GPU_NAME,
     "gpu_memory_gib": GPU_TOTAL_GIB,
-    "tf32_enabled": True,
-    "mixed_precision": USE_MIXED_PRECISION,
+    "patents_per_batch": PATENTS_PER_BATCH,
     "num_epochs": NUM_EPOCHS,
-    "patents_per_batch": (
-        configured_patents_per_batch
-    ),
-    "train_batches": len(
-        train_loader
-    ),
+    "train_batches": len(train_loader),
+    "dev_batches": len(dev_loader),
+    "test_batches": len(test_loader),
     "num_workers": getattr(
         train_loader,
         "num_workers",
         0,
     ),
-    "warmup": {
-        "kl": KL_WARMUP_EPOCHS,
-        "hierarchy": (
-            HIERARCHY_WARMUP_EPOCHS
-        ),
-        "reconciliation": (
-            RECONCILIATION_WARMUP_EPOCHS
-        ),
-        "diversity": (
-            DIVERSITY_WARMUP_EPOCHS
-        ),
-        "phi": PHI_WARMUP_EPOCHS,
-    },
-    "early_stopping_patience": (
-        EARLY_STOPPING_PATIENCE
+    "full_dev_every_epochs": (
+        FULL_DEV_EVERY_EPOCHS
     ),
-    "early_stopping_start_epoch": (
-        EARLY_STOPPING_START_EPOCH
-    ),
-    "minimum_improvement": (
-        MINIMUM_IMPROVEMENT
-    ),
-    "checkpoint_directory": (
-        RUN_CHECKPOINT_DIR
-    ),
-    "log_directory": RUN_LOG_DIR,
-    "result_directory": RUN_RESULT_DIR,
-    "dataset_sizes": {
-        "train_patents": len(
-            train_dataset
-        ),
-        "dev_patents": len(
-            dev_dataset
-        ),
-        "test_patents": len(
-            test_dataset
-        ),
-    },
-    "config": config_to_dictionary(
-        CONFIG
-    ),
+    "fast_dev_batches": FAST_DEV_BATCHES,
+    "config": config_to_dictionary(CONFIG),
 }
 
-atomic_json_save_local(
+atomic_json_save(
     run_manifest,
-    RESUME_MANIFEST_PATH,
+    RUN_MANIFEST_PATH,
 )
 
-if not os.path.isfile(
-    RUN_MANIFEST_PATH
-):
-    atomic_json_save_local(
-        run_manifest,
-        RUN_MANIFEST_PATH,
-    )
+print("=" * 90)
+print("SECTION 6 — T4-OPTIMIZED ANTI-COLLAPSE TRAINING")
+print("=" * 90)
+print(f"Run name              : {RUN_NAME}")
+print(f"GPU                   : {GPU_NAME}")
+print(f"GPU memory            : {GPU_TOTAL_GIB:.2f} GiB")
+print(f"Seed                  : {SEED}")
+print(f"Epochs                : {NUM_EPOCHS}")
+print(f"Patents/batch         : {PATENTS_PER_BATCH}")
+print(f"Topics                : {CONFIG.num_topics}")
+print(f"Train batches         : {len(train_loader):,}")
+print(f"DEV batches           : {len(dev_loader):,}")
+print(f"Workers               : {getattr(train_loader, 'num_workers', 0)}")
+print(f"KL max                : {KL_MAX_WEIGHT}")
+print(f"Hierarchy max         : {HIERARCHY_MAX_WEIGHT}")
+print(f"Hierarchy starts      : epoch {HIERARCHY_START_EPOCH + 1}")
+print(f"Full DEV interval     : {FULL_DEV_EVERY_EPOCHS}")
+print(f"Fast DEV batches      : {FAST_DEV_BATCHES}")
+print(f"Minimum active topics : {MIN_ACTIVE_TOPICS}")
+print(f"Maximum topic share   : {MAX_TOPIC_SHARE:.0%}")
+print(f"Minimum marginal H    : {MIN_MARGINAL_ENTROPY}")
+print(f"Checkpoint directory  : {RUN_CHECKPOINT_DIR}")
+print("=" * 90)
 
+print("\nObjective schedule:")
 
-# ============================================================
-# 18. Resume state
-# ============================================================
-
-start_epoch = 0
-best_validation_loss = float("inf")
-epochs_without_improvement = 0
-training_history = []
-
-if RESUME_TRAINING:
-    resumed_checkpoint = load_checkpoint(
-        LATEST_CHECKPOINT_PATH,
-        restore_optimizers=True,
-        restore_rng=True,
-    )
-
-    checkpoint_epoch = int(
-        resumed_checkpoint["epoch"]
-    )
-
-    start_epoch = (
-        checkpoint_epoch + 1
-    )
-
-    best_validation_loss = float(
-        resumed_checkpoint.get(
-            "best_validation_loss",
-            float("inf"),
+for check_epoch in [
+    0,
+    2,
+    5,
+    7,
+    8,
+    11,
+    15,
+    23,
+]:
+    if check_epoch < NUM_EPOCHS:
+        print(
+            f"Epoch {check_epoch + 1:02d}: "
+            f"weights="
+            f"{get_objective_weights(check_epoch)}, "
+            f"hierarchy="
+            f"{should_compute_hierarchy(check_epoch)}, "
+            f"anti="
+            f"{anti_collapse_schedule(check_epoch)}"
         )
-    )
-
-    epochs_without_improvement = int(
-        resumed_checkpoint.get(
-            "epochs_without_improvement",
-            0,
-        )
-    )
-
-    training_history = list(
-        resumed_checkpoint.get(
-            "history",
-            [],
-        )
-    )
-
-    print("\n" + "=" * 90)
-    print("CHECKPOINT RESTORED")
-    print("=" * 90)
-    print(
-        f"Completed through epoch : "
-        f"{checkpoint_epoch + 1}"
-    )
-    print(
-        f"Next epoch              : "
-        f"{start_epoch + 1}"
-    )
-    print(
-        f"Previous best dev       : "
-        f"{best_validation_loss}"
-    )
-    print(
-        f"Patience counter        : "
-        f"{epochs_without_improvement}/"
-        f"{EARLY_STOPPING_PATIENCE}"
-    )
-    print(
-        f"History records         : "
-        f"{len(training_history)}"
-    )
-    print("=" * 90)
-
-else:
-    print(
-        "\nStarting a new training run."
-    )
 
 
 # ============================================================
 # 19. Training loop
 # ============================================================
 
-already_completed = (
-    start_epoch >= NUM_EPOCHS
-)
+history = []
 
-if already_completed:
-    print(
-        f"\n[Already complete] "
-        f"Checkpoint contains "
-        f"{start_epoch} completed epochs."
-    )
+best_selection = None
+best_epoch = None
 
-print("\n" + "=" * 90)
-print("TRAINING STARTED/RESUMED")
-print("=" * 90)
+full_dev_evaluations_without_improvement = 0
+stopped_early = False
 
 execution_start_time = time.time()
 
-initial_history_length = len(
-    training_history
-)
-
-stopped_early = False
-
 try:
-    if not already_completed:
-        for epoch in range(
-            start_epoch,
-            NUM_EPOCHS,
-        ):
-            epoch_one_based = (
-                epoch + 1
+    for epoch in range(NUM_EPOCHS):
+        epoch_one_based = epoch + 1
+
+        run_full_dev = (
+            epoch_one_based
+            % FULL_DEV_EVERY_EPOCHS
+            == 0
+            or epoch_one_based == NUM_EPOCHS
+        )
+
+        print("\n" + "-" * 90)
+        print(
+            f"Epoch {epoch_one_based}/{NUM_EPOCHS}"
+        )
+        print(
+            f"Hierarchy enabled : "
+            f"{should_compute_hierarchy(epoch)}"
+        )
+        print(
+            f"DEV mode          : "
+            f"{'FULL' if run_full_dev else 'FAST'}"
+        )
+        print(
+            f"Objective weights : "
+            f"{get_objective_weights(epoch)}"
+        )
+        print(
+            f"Anti-collapse     : "
+            f"{anti_collapse_schedule(epoch)}"
+        )
+        print("-" * 90)
+
+        epoch_start_time = time.time()
+
+        train_metrics = train_one_epoch(epoch)
+
+        if run_full_dev:
+            dev_metrics = evaluate_one_epoch(
+                data_loader=dev_loader,
+                epoch=epoch,
+                description=(
+                    f"Full DEV "
+                    f"{epoch_one_based}/{NUM_EPOCHS}"
+                ),
+                maximum_batches=None,
+            )
+        else:
+            dev_metrics = evaluate_one_epoch(
+                data_loader=dev_loader,
+                epoch=epoch,
+                description=(
+                    f"Fast DEV "
+                    f"{epoch_one_based}/{NUM_EPOCHS}"
+                ),
+                maximum_batches=FAST_DEV_BATCHES,
             )
 
-            epoch_start_time = (
-                time.time()
+        candidate_selection = (
+            build_selection_record(
+                dev_metrics
+            )
+        )
+
+        improved = False
+
+        # Best checkpoint는 전체 DEV 평가에서만 갱신
+        if run_full_dev:
+            improved = candidate_is_better(
+                candidate=candidate_selection,
+                best_selection=best_selection,
             )
 
-            current_weights = (
-                get_objective_weights(
-                    epoch
+            if improved:
+                best_selection = (
+                    candidate_selection
                 )
-            )
+                best_epoch = epoch
 
-            print("\n" + "-" * 90)
-            print(
-                f"Starting epoch "
-                f"{epoch_one_based}/"
-                f"{NUM_EPOCHS}"
-            )
-            print(
-                f"Objective weights: "
-                f"{current_weights}"
-            )
-            print("-" * 90)
-
-            train_metrics = (
-                train_one_epoch(
-                    epoch
-                )
-            )
-
-            dev_metrics = (
-                evaluate_one_epoch(
-                    data_loader=dev_loader,
-                    epoch=epoch,
-                    description=(
-                        f"Dev "
-                        f"{epoch_one_based}/"
-                        f"{NUM_EPOCHS}"
-                    ),
-                )
-            )
-
-            epoch_duration = (
-                time.time()
-                - epoch_start_time
-            )
-
-            can_monitor_improvement = (
+                full_dev_evaluations_without_improvement = 0
+            elif (
                 epoch_one_based
                 >= EARLY_STOPPING_START_EPOCH
-            )
+                and best_selection is not None
+                and best_selection["eligible"]
+            ):
+                full_dev_evaluations_without_improvement += 1
 
-            improved = False
+        epoch_duration = (
+            time.time() - epoch_start_time
+        )
 
-            if can_monitor_improvement:
-                validation_loss = float(
-                    dev_metrics["total"]
-                )
-
-                improved = (
-                    validation_loss
-                    < best_validation_loss
-                    - MINIMUM_IMPROVEMENT
-                )
-
-                if improved:
-                    best_validation_loss = (
-                        validation_loss
-                    )
-
-                    epochs_without_improvement = 0
-
-                else:
-                    epochs_without_improvement += 1
-
-            with torch.no_grad():
-                anchor_coordinates = (
-                    topic_anchor.coordinates()
-                    .detach()
-                    .cpu()
-                    .tolist()
-                )
-
-                anchor_gap_loss = float(
-                    topic_anchor.gap_loss()
-                    .detach()
-                    .item()
-                )
-
-            epoch_record = {
-                "epoch": int(
-                    epoch
-                ),
-
-                "epoch_one_based": int(
-                    epoch_one_based
-                ),
-
-                "duration_seconds": float(
-                    epoch_duration
-                ),
-
-                "weights": (
-                    current_weights
-                ),
-
-                "train": (
-                    train_metrics
-                ),
-
-                "dev": (
-                    dev_metrics
-                ),
-
-                "anchor_coordinates": (
-                    anchor_coordinates
-                ),
-
-                "anchor_gap_loss": (
-                    anchor_gap_loss
-                ),
-
-                "early_stopping_active": (
-                    can_monitor_improvement
-                ),
-
-                "best_validation_loss": (
-                    None
-                    if not math.isfinite(
-                        best_validation_loss
-                    )
-                    else float(
-                        best_validation_loss
-                    )
-                ),
-
-                "improved": bool(
-                    improved
-                ),
-
-                "epochs_without_improvement": int(
-                    epochs_without_improvement
-                ),
-
-                "main_learning_rate": float(
-                    main_optimizer.param_groups[
-                        0
-                    ]["lr"]
-                ),
-
-                "phi_learning_rate": float(
-                    phi_optimizer.param_groups[
-                        0
-                    ]["lr"]
-                ),
-
-                "gpu_name": GPU_NAME,
-            }
-
-            # 동일 epoch 중복 방지
-            training_history = [
-                record
-                for record in training_history
-                if int(
-                    record.get(
-                        "epoch",
-                        -1,
-                    )
-                ) != int(epoch)
-            ]
-
-            training_history.append(
-                epoch_record
-            )
-
-            training_history.sort(
-                key=lambda record: int(
-                    record.get(
-                        "epoch",
-                        -1,
-                    )
-                )
-            )
-
-            append_jsonl(
-                epoch_record,
-                HISTORY_JSONL_PATH,
-            )
-
-            # latest.pt 매 epoch 저장
-            if SAVE_LATEST_EVERY_EPOCH:
-                save_checkpoint(
-                    path=LATEST_CHECKPOINT_PATH,
-                    epoch=epoch,
-                    best_validation_loss=(
-                        best_validation_loss
-                    ),
-                    epochs_without_improvement=(
-                        epochs_without_improvement
-                    ),
-                    history=training_history,
-                )
-
-            periodic_saved_path = None
-
-            if (
+        epoch_record = {
+            "epoch": int(epoch),
+            "epoch_one_based": int(
                 epoch_one_based
-                % CHECKPOINT_INTERVAL_EPOCHS
-                == 0
-            ):
-                periodic_saved_path = (
-                    periodic_checkpoint_path(
-                        epoch_one_based
-                    )
-                )
+            ),
+            "duration_seconds": float(
+                epoch_duration
+            ),
+            "full_dev_evaluation": bool(
+                run_full_dev
+            ),
+            "objective_weights": (
+                get_objective_weights(epoch)
+            ),
+            "anti_collapse_schedule": (
+                anti_collapse_schedule(epoch)
+            ),
+            "hierarchy_computed": bool(
+                should_compute_hierarchy(epoch)
+            ),
+            "train": train_metrics,
+            "dev": dev_metrics,
+            "candidate_selection": (
+                candidate_selection
+            ),
+            "best_selection": (
+                best_selection
+            ),
+            "improved": bool(improved),
+            "full_dev_evaluations_without_improvement": int(
+                full_dev_evaluations_without_improvement
+            ),
+        }
 
-                save_checkpoint(
-                    path=periodic_saved_path,
-                    epoch=epoch,
-                    best_validation_loss=(
-                        best_validation_loss
-                    ),
-                    epochs_without_improvement=(
-                        epochs_without_improvement
-                    ),
-                    history=training_history,
-                )
+        history.append(epoch_record)
 
-            if improved:
-                save_checkpoint(
-                    path=BEST_CHECKPOINT_PATH,
-                    epoch=epoch,
-                    best_validation_loss=(
-                        best_validation_loss
-                    ),
-                    epochs_without_improvement=(
-                        epochs_without_improvement
-                    ),
-                    history=training_history,
-                )
+        append_jsonl(
+            epoch_record,
+            HISTORY_JSONL_PATH,
+        )
 
-            print(
-                f"\nEpoch "
-                f"{epoch_one_based:03d}/"
-                f"{NUM_EPOCHS:03d} | "
-                f"{epoch_duration:.1f}s "
-                f"({epoch_duration/3600:.2f}h)"
+        # latest는 매 epoch 저장
+        save_checkpoint(
+            path=LATEST_CHECKPOINT_PATH,
+            epoch=epoch,
+            history=history,
+            best_selection=best_selection,
+        )
+
+        if (
+            epoch_one_based
+            % CHECKPOINT_INTERVAL_EPOCHS
+            == 0
+        ):
+            periodic_path = os.path.join(
+                RUN_CHECKPOINT_DIR,
+                f"epoch_{epoch_one_based:03d}.pt",
             )
 
-            print(
-                f"  train total="
-                f"{train_metrics['total']:.6f}, "
-                f"rec="
-                f"{train_metrics['reconstruction']:.6f}, "
-                f"kl="
-                f"{train_metrics['kl']:.6f}, "
-                f"hier="
-                f"{train_metrics['hierarchy']:.6f}"
+            save_checkpoint(
+                path=periodic_path,
+                epoch=epoch,
+                history=history,
+                best_selection=best_selection,
             )
 
-            print(
-                f"  dev   total="
-                f"{dev_metrics['total']:.6f}, "
-                f"rec="
-                f"{dev_metrics['reconstruction']:.6f}, "
-                f"kl="
-                f"{dev_metrics['kl']:.6f}, "
-                f"hier="
-                f"{dev_metrics['hierarchy']:.6f}"
+        if run_full_dev and improved:
+            save_checkpoint(
+                path=BEST_CHECKPOINT_PATH,
+                epoch=epoch,
+                history=history,
+                best_selection=best_selection,
             )
 
+        print(
+            f"\nEpoch {epoch_one_based:02d} | "
+            f"{epoch_duration / 60:.1f} min | "
+            f"train={train_metrics['total']:.5f} | "
+            f"dev={dev_metrics['total']:.5f}"
+        )
+
+        print(
+            f"Train speed       : "
+            f"{train_metrics['patents_per_second']:.2f} patents/s"
+        )
+
+        print(
+            f"Peak GPU          : "
+            f"{train_metrics['peak_gpu_gib']:.2f} GiB"
+        )
+
+        print(
+            f"DEV active topics : "
+            f"{dev_metrics['active_topics']}/"
+            f"{CONFIG.num_topics}"
+        )
+
+        print(
+            f"DEV max share     : "
+            f"{dev_metrics['maximum_topic_share']:.2%}"
+        )
+
+        print(
+            f"DEV marginal H    : "
+            f"{dev_metrics['normalized_marginal_entropy']:.4f}"
+        )
+
+        print(
+            f"Candidate valid   : "
+            f"{candidate_selection['eligible']}"
+        )
+
+        if run_full_dev:
             print(
-                f"  phi updates="
-                f"{train_metrics['phi_updates']}, "
-                f"gap={anchor_gap_loss:.6f}, "
-                f"max Sinkhorn error="
-                f"{train_metrics['maximum_sinkhorn_error']:.3e}"
+                f"Best updated      : {improved}"
             )
 
+        if best_selection is not None:
             print(
-                f"  speed="
-                f"{train_metrics['patents_per_second']:.2f} patents/s, "
-                f"peak GPU="
-                f"{train_metrics['peak_gpu_gib']:.2f} GiB"
+                f"Current best      : "
+                f"active={best_selection['active_topics']}, "
+                f"share="
+                f"{best_selection['maximum_topic_share']:.2%}, "
+                f"H="
+                f"{best_selection['marginal_entropy']:.4f}"
             )
 
+        if (
+            run_full_dev
+            and epoch_one_based
+            >= EARLY_STOPPING_START_EPOCH
+            and best_selection is not None
+            and best_selection["eligible"]
+            and full_dev_evaluations_without_improvement
+            >= EARLY_STOPPING_PATIENCE
+        ):
+            stopped_early = True
+
             print(
-                f"  latest checkpoint: "
-                f"{LATEST_CHECKPOINT_PATH}"
+                "\nEarly stopping activated."
             )
+            break
 
-            if periodic_saved_path:
-                print(
-                    f"  periodic checkpoint: "
-                    f"{periodic_saved_path}"
-                )
-
-            if improved:
-                print(
-                    f"  best checkpoint updated: "
-                    f"{BEST_CHECKPOINT_PATH}"
-                )
-
-            if can_monitor_improvement:
-                print(
-                    f"  best dev="
-                    f"{best_validation_loss:.6f}, "
-                    f"patience="
-                    f"{epochs_without_improvement}/"
-                    f"{EARLY_STOPPING_PATIENCE}"
-                )
-            else:
-                print(
-                    "  early stopping inactive; "
-                    f"starts at epoch "
-                    f"{EARLY_STOPPING_START_EPOCH}"
-                )
-
-            if (
-                can_monitor_improvement
-                and epochs_without_improvement
-                >= EARLY_STOPPING_PATIENCE
-            ):
-                stopped_early = True
-
-                print(
-                    f"\nEarly stopping triggered "
-                    f"at epoch {epoch_one_based}."
-                )
-
-                break
-
-            gc.collect()
+        gc.collect()
 
 except Exception as training_error:
     error_trace = traceback.format_exc()
 
     print("\n" + "!" * 90)
-    print("TRAINING INTERRUPTED BY ERROR")
+    print("TRAINING ERROR")
     print("!" * 90)
-    print(str(training_error))
     print(error_trace)
 
     with open(
         ERROR_LOG_PATH,
-        "a",
+        "w",
         encoding="utf-8",
     ) as file:
-        file.write(
-            "\n"
-            + "=" * 90
-            + "\n"
-        )
-
-        file.write(
-            datetime.now().isoformat()
-            + "\n"
-        )
-
-        file.write(
-            str(training_error)
-            + "\n"
-        )
-
-        file.write(
-            error_trace
-            + "\n"
-        )
+        file.write(error_trace)
 
     gc.collect()
     torch.cuda.empty_cache()
@@ -12758,51 +12378,14 @@ except Exception as training_error:
     raise
 
 
-execution_duration = (
-    time.time()
-    - execution_start_time
-)
-
-
 # ============================================================
-# 20. Validate latest checkpoint
+# 20. Ensure best checkpoint exists
 # ============================================================
 
-if not training_history:
-    raise RuntimeError(
-        "Training history is empty."
-    )
-
-last_completed_epoch = int(
-    training_history[-1]["epoch"]
-)
-
-if not os.path.isfile(
-    LATEST_CHECKPOINT_PATH
-):
-    save_checkpoint(
-        path=LATEST_CHECKPOINT_PATH,
-        epoch=last_completed_epoch,
-        best_validation_loss=(
-            best_validation_loss
-        ),
-        epochs_without_improvement=(
-            epochs_without_improvement
-        ),
-        history=training_history,
-    )
-
-
-# ============================================================
-# 21. Ensure best checkpoint exists
-# ============================================================
-
-if not os.path.isfile(
-    BEST_CHECKPOINT_PATH
-):
+if not os.path.isfile(BEST_CHECKPOINT_PATH):
     print(
-        "[WARNING] best.pt does not exist. "
-        "Using latest.pt as fallback."
+        "[WARNING] 유효한 best checkpoint가 없어 "
+        "latest.pt를 best.pt로 사용합니다."
     )
 
     latest_checkpoint = safe_torch_load(
@@ -12817,58 +12400,57 @@ if not os.path.isfile(
 
 
 # ============================================================
-# 22. Restore best checkpoint
+# 21. Restore best checkpoint
 # ============================================================
 
-best_checkpoint = load_checkpoint(
+best_checkpoint = safe_torch_load(
     BEST_CHECKPOINT_PATH,
-    restore_optimizers=False,
-    restore_rng=False,
+    map_location="cpu",
 )
+
+depth_ot_model.load_state_dict(
+    best_checkpoint["model_state_dict"]
+)
+
+topic_anchor.load_state_dict(
+    best_checkpoint[
+        "topic_anchor_state_dict"
+    ]
+)
+
+depth_ot_model.to(DEVICE)
+topic_anchor.to(DEVICE)
 
 best_epoch = int(
     best_checkpoint["epoch"]
 )
 
-best_validation_loss = float(
-    best_checkpoint.get(
-        "best_validation_loss",
-        best_validation_loss,
-    )
-)
-
-depth_ot_model.to(
-    DEVICE
-)
-
-topic_anchor.to(
-    DEVICE
-)
-
 print(
-    f"\nBest checkpoint restored "
-    f"from epoch {best_epoch + 1}."
+    f"\nBest checkpoint restored: "
+    f"epoch {best_epoch + 1}"
 )
 
 
 # ============================================================
-# 23. Final dev/test evaluation
+# 22. Final full evaluation
 # ============================================================
 
 print("\n" + "=" * 90)
-print("FINAL EVALUATION")
+print("FINAL FULL EVALUATION")
 print("=" * 90)
 
 final_dev_metrics = evaluate_one_epoch(
     data_loader=dev_loader,
     epoch=best_epoch,
-    description="Final dev evaluation",
+    description="Final full DEV",
+    maximum_batches=None,
 )
 
 final_test_metrics = evaluate_one_epoch(
     data_loader=test_loader,
     epoch=best_epoch,
-    description="Final test evaluation",
+    description="Final full TEST",
+    maximum_batches=None,
 )
 
 with torch.no_grad():
@@ -12876,7 +12458,6 @@ with torch.no_grad():
         topic_anchor.coordinates()
         .detach()
         .cpu()
-        .tolist()
     )
 
     final_cost_matrix = (
@@ -12887,224 +12468,101 @@ with torch.no_grad():
 
 
 # ============================================================
-# 24. Periodic checkpoint list
+# 23. Save final outputs
 # ============================================================
 
-periodic_checkpoint_paths = []
-
-for completed_epoch in range(
-    CHECKPOINT_INTERVAL_EPOCHS,
-    NUM_EPOCHS + 1,
-    CHECKPOINT_INTERVAL_EPOCHS,
-):
-    candidate_path = (
-        periodic_checkpoint_path(
-            completed_epoch
-        )
-    )
-
-    if os.path.isfile(
-        candidate_path
-    ):
-        periodic_checkpoint_paths.append(
-            candidate_path
-        )
-
-
-# ============================================================
-# 25. Save final results
-# ============================================================
-
-epochs_completed_this_execution = max(
-    0,
-    len(training_history)
-    - initial_history_length,
+execution_duration = (
+    time.time() - execution_start_time
 )
 
 training_summary = {
     "run_name": RUN_NAME,
     "feature_run_name": FEATURE_RUN_NAME,
-
-    "resumed": (
-        RESUME_TRAINING
-    ),
-
-    "resume_start_epoch_one_based": (
-        start_epoch + 1
-        if start_epoch < NUM_EPOCHS
-        else None
-    ),
-
-    "execution_started_at": (
-        datetime.fromtimestamp(
-            execution_start_time
-        ).isoformat()
-    ),
-
-    "execution_completed_at": (
-        datetime.now().isoformat()
-    ),
-
-    "execution_duration_seconds": (
+    "seed": SEED,
+    "fresh_training": True,
+    "resume": False,
+    "completed_at": datetime.now().isoformat(),
+    "duration_seconds": float(
         execution_duration
     ),
-
-    "stopped_early": (
+    "stopped_early": bool(
         stopped_early
     ),
-
-    "epochs_completed_this_execution": (
-        epochs_completed_this_execution
-    ),
-
-    "total_epochs_recorded": len(
-        training_history
-    ),
-
-    "last_completed_epoch": (
-        last_completed_epoch
-    ),
-
-    "last_completed_epoch_one_based": (
-        last_completed_epoch + 1
-    ),
-
-    "best_epoch": (
-        best_epoch
-    ),
-
-    "best_epoch_one_based": (
+    "epochs_recorded": len(history),
+    "best_epoch": int(best_epoch),
+    "best_epoch_one_based": int(
         best_epoch + 1
     ),
-
-    "best_validation_loss": float(
-        best_validation_loss
+    "best_selection": (
+        best_checkpoint.get(
+            "best_selection"
+        )
     ),
-
-    "final_dev": (
-        final_dev_metrics
+    "final_dev": final_dev_metrics,
+    "final_test": final_test_metrics,
+    "latest_checkpoint": (
+        LATEST_CHECKPOINT_PATH
     ),
-
-    "final_test": (
-        final_test_metrics
+    "best_checkpoint": (
+        BEST_CHECKPOINT_PATH
     ),
-
-    "final_anchor_coordinates": (
-        final_anchor_coordinates
+    "history_path": (
+        HISTORY_JSONL_PATH
     ),
-
-    "gpu": GPU_NAME,
-    "gpu_memory_gib": GPU_TOTAL_GIB,
-
+    "run_manifest": (
+        RUN_MANIFEST_PATH
+    ),
+    "learned_anchor": (
+        LEARNED_ANCHOR_PATH
+    ),
     "training_settings": {
-        "num_epochs": NUM_EPOCHS,
-
         "patents_per_batch": (
-            configured_patents_per_batch
+            PATENTS_PER_BATCH
         ),
-
-        "warmup_epochs": {
-            "kl": KL_WARMUP_EPOCHS,
-            "hierarchy": (
-                HIERARCHY_WARMUP_EPOCHS
-            ),
-            "reconciliation": (
-                RECONCILIATION_WARMUP_EPOCHS
-            ),
-            "diversity": (
-                DIVERSITY_WARMUP_EPOCHS
-            ),
-            "phi": PHI_WARMUP_EPOCHS,
-        },
-
-        "early_stopping_patience": (
-            EARLY_STOPPING_PATIENCE
-        ),
-
-        "early_stopping_start_epoch": (
-            EARLY_STOPPING_START_EPOCH
-        ),
-
-        "minimum_improvement": (
-            MINIMUM_IMPROVEMENT
-        ),
-
-        "checkpoint_interval_epochs": (
-            CHECKPOINT_INTERVAL_EPOCHS
-        ),
-
-        "latest_every_epoch": (
-            SAVE_LATEST_EVERY_EPOCH
-        ),
-
+        "num_epochs": NUM_EPOCHS,
+        "anti_collapse": True,
+        "t4_optimized": True,
         "mixed_precision": (
             USE_MIXED_PRECISION
         ),
-
         "tf32": True,
-
+        "full_dev_every_epochs": (
+            FULL_DEV_EVERY_EPOCHS
+        ),
+        "fast_dev_batches": (
+            FAST_DEV_BATCHES
+        ),
         "num_workers": getattr(
             train_loader,
             "num_workers",
             0,
         ),
     },
-
-    "latest_checkpoint": (
-        LATEST_CHECKPOINT_PATH
-    ),
-
-    "best_checkpoint": (
-        BEST_CHECKPOINT_PATH
-    ),
-
-    "periodic_checkpoints": (
-        periodic_checkpoint_paths
-    ),
-
-    "history_path": (
-        HISTORY_JSONL_PATH
-    ),
-
-    "manifest_path": (
-        RUN_MANIFEST_PATH
-    ),
 }
 
-atomic_json_save_local(
+atomic_json_save(
     training_summary,
     TRAINING_SUMMARY_PATH,
 )
 
 atomic_torch_save(
     {
-        "coordinates": torch.tensor(
-            final_anchor_coordinates,
-            dtype=torch.float32,
+        "coordinates": (
+            final_anchor_coordinates
         ),
-
-        "cost_matrix": (
-            final_cost_matrix
-        ),
-
-        "best_epoch": (
-            best_epoch
-        ),
-
-        "best_epoch_one_based": (
+        "cost_matrix": final_cost_matrix,
+        "best_epoch": int(best_epoch),
+        "best_epoch_one_based": int(
             best_epoch + 1
         ),
-
-        "run_name": (
-            RUN_NAME
-        ),
+        "run_name": RUN_NAME,
     },
     LEARNED_ANCHOR_PATH,
 )
 
 
 # ============================================================
-# 26. Final validation
+# 24. Validate outputs
 # ============================================================
 
 required_final_files = [
@@ -13124,174 +12582,89 @@ missing_final_files = [
 
 if missing_final_files:
     raise RuntimeError(
-        "Required output files are missing: "
+        "필수 출력 파일이 없습니다: "
         f"{missing_final_files}"
     )
 
 
 # ============================================================
-# 27. Final report
+# 25. Final report
 # ============================================================
 
 print("\n" + "=" * 90)
 print("SECTION 6 COMPLETED SUCCESSFULLY")
 print("=" * 90)
 
-print(f"Run name         : {RUN_NAME}")
-print(f"GPU              : {GPU_NAME}")
-print(f"Resumed          : {RESUME_TRAINING}")
+print(f"Run name          : {RUN_NAME}")
+print(f"GPU               : {GPU_NAME}")
+print(f"Best epoch        : {best_epoch + 1}")
+print(f"Stopped early     : {stopped_early}")
 
 print(
-    f"Epochs this run  : "
-    f"{epochs_completed_this_execution}"
+    f"DEV active topics : "
+    f"{final_dev_metrics['active_topics']}/"
+    f"{CONFIG.num_topics}"
 )
 
 print(
-    f"Total recorded   : "
-    f"{len(training_history)}"
+    f"DEV max share     : "
+    f"{final_dev_metrics['maximum_topic_share']:.2%}"
 )
 
 print(
-    f"Last epoch       : "
-    f"{last_completed_epoch + 1}"
+    f"DEV marginal H    : "
+    f"{final_dev_metrics['normalized_marginal_entropy']:.4f}"
 )
 
 print(
-    f"Stopped early    : "
-    f"{stopped_early}"
+    f"TEST active topics: "
+    f"{final_test_metrics['active_topics']}/"
+    f"{CONFIG.num_topics}"
 )
 
 print(
-    f"Best epoch       : "
-    f"{best_epoch + 1}"
+    f"TEST max share    : "
+    f"{final_test_metrics['maximum_topic_share']:.2%}"
 )
 
 print(
-    f"Best dev loss    : "
-    f"{best_validation_loss:.6f}"
+    f"TEST marginal H   : "
+    f"{final_test_metrics['normalized_marginal_entropy']:.4f}"
 )
 
-print(
-    f"Final dev loss   : "
-    f"{final_dev_metrics['total']:.6f}"
-)
-
-print(
-    f"Final test loss  : "
-    f"{final_test_metrics['total']:.6f}"
-)
-
-print(
-    f"Latest checkpoint: "
-    f"{LATEST_CHECKPOINT_PATH}"
-)
-
-print(
-    f"Best checkpoint  : "
-    f"{BEST_CHECKPOINT_PATH}"
-)
-
-print(
-    f"Periodic saved   : "
-    f"{len(periodic_checkpoint_paths)} files"
-)
-
-for checkpoint_path in periodic_checkpoint_paths:
-    print(
-        f"  - {checkpoint_path}"
-    )
-
-print(
-    f"Training summary : "
-    f"{TRAINING_SUMMARY_PATH}"
-)
-
-print(
-    f"Learned anchor   : "
-    f"{LEARNED_ANCHOR_PATH}"
-)
+print(f"Best checkpoint   : {BEST_CHECKPOINT_PATH}")
+print(f"Latest checkpoint : {LATEST_CHECKPOINT_PATH}")
+print(f"Training summary  : {TRAINING_SUMMARY_PATH}")
+print(f"Learned anchor    : {LEARNED_ANCHOR_PATH}")
 
 print("=" * 90)
 
-print(
-    "\nBest model is loaded and ready for "
-    "Section 7 deterministic inference."
+anti_collapse_passed = (
+    final_dev_metrics["active_topics"]
+    >= MIN_ACTIVE_TOPICS
+    and final_dev_metrics[
+        "maximum_topic_share"
+    ]
+    <= MAX_TOPIC_SHARE
+    and final_dev_metrics[
+        "normalized_marginal_entropy"
+    ]
+    >= MIN_MARGINAL_ENTROPY
 )
 
-
-# ============================================================
-# SECTION 7:
-# Deterministic Inference and Global Topic Hierarchy Extraction
-# COMPLETE SINGLE-CELL VERSION
-# ============================================================
-
-import os
-import json
-import math
-from collections import defaultdict
-from datetime import datetime
-
-import torch
-from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
-
-
-# ============================================================
-# 0. Preconditions
-# ============================================================
-
-required_section7_globals = [
-    "CONFIG",
-    "DIRS",
-    "DEVICE",
-    "FEATURE_RUN_NAME",
-    "depth_ot_model",
-    "topic_anchor",
-    "train_dataset",
-    "dev_dataset",
-    "test_dataset",
-    "patent_collate_fn",
-    "move_depth_ot_batch",
-    "VOCAB",
-    "RUN_RESULT_DIR",
-    "BEST_CHECKPOINT_PATH",
-]
-
-missing_section7_globals = [
-    name
-    for name in required_section7_globals
-    if name not in globals()
-]
-
-if missing_section7_globals:
-    raise RuntimeError(
-        "Section 7 prerequisites are missing: "
-        f"{missing_section7_globals}. "
-        "Run Sections 0 through 6 first."
+if anti_collapse_passed:
+    print(
+        "\n[PASS] Anti-collapse 기준을 충족했습니다."
     )
-
-if not os.path.isfile(
-    BEST_CHECKPOINT_PATH
-):
-    raise FileNotFoundError(
-        "Best checkpoint does not exist: "
-        f"{BEST_CHECKPOINT_PATH}"
+    print(
+        "Section 7 inference를 실행할 수 있습니다."
     )
-
-if not isinstance(VOCAB, list):
-    raise TypeError(
-        "VOCAB must be a list."
+else:
+    print(
+        "\n[WARNING] Anti-collapse 기준을 충족하지 못했습니다."
     )
-
-if len(VOCAB) != int(
-    getattr(
-        CONFIG,
-        "vocab_size",
-        len(VOCAB),
-    )
-):
-    raise ValueError(
-        "Vocabulary size does not match CONFIG.vocab_size."
+    print(
+        "3개 seed로 확장하지 말고 현재 로그를 먼저 확인하세요."
     )
 
 
