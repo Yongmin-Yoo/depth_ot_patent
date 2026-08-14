@@ -1,168 +1,143 @@
-# ============================================================
-# ECRTM — Colab standalone runner
-# Mount -> install -> load -> train seeds 43/44
-# -> reuse seed 42 -> patent-level CPC evaluation -> save
-# ============================================================
+# ======================================================================================
+# ECRTM 3-SEED PATENT CPC BENCHMARK
+# ONE-CELL GOOGLE COLAB — NVIDIA T4
+#
+# Model  : ECRTM (ICML 2023, official TopMost implementation)
+# Seeds  : 42, 43, 44
+# Topics : 30
+# Eval   : Patent-level CPC Section / Class / Subclass
+# ======================================================================================
 
+# --------------------------------------------------------------------------------------
+# 0. Environment and packages
+# --------------------------------------------------------------------------------------
 import os
 import sys
 import gc
+import re
 import json
 import time
 import pickle
 import random
-import inspect
-import traceback
+import hashlib
+import warnings
 import subprocess
-import importlib
 from pathlib import Path
+from datetime import datetime
+from collections import Counter, defaultdict
 
-# ------------------------------------------------------------
-# 0. Configuration
-# ------------------------------------------------------------
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["PYTHONHASHSEED"] = "42"
+os.environ["OMP_NUM_THREADS"] = "2"
+os.environ["MKL_NUM_THREADS"] = "2"
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
-PROJECT_ROOT = Path("/content/drive/MyDrive/depth_ot_patent")
+warnings.filterwarnings("ignore")
 
-PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
-CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
-RESULT_DIR = PROJECT_ROOT / "results" / "cpc_alignment"
-LOG_DIR = PROJECT_ROOT / "logs"
+def install_required_packages():
+    packages = [
+        ("topmost", "topmost"),
+        ("gensim", "gensim"),
+        ("sklearn", "scikit-learn"),
+        ("pandas", "pandas"),
+        ("scipy", "scipy"),
+        ("tqdm", "tqdm"),
+    ]
 
-TRAIN_BOW_PATH = PROCESSED_DIR / "bow_train.npz"
-TEST_BOW_PATH = PROCESSED_DIR / "bow_test.npz"
-VOCAB_PATH = PROCESSED_DIR / "vocab.pkl"
+    missing = []
 
-TEST_RECORDS_PATH = PROCESSED_DIR / "test_records.pkl"
-REF_TEST_PATH = PROCESSED_DIR / "ref_test.pkl"
+    for module_name, pip_name in packages:
+        try:
+            __import__(module_name)
+        except Exception:
+            missing.append(pip_name)
 
-# CPC 정답 참조 파일
-CPC_REFERENCE_PATH = (
-    PROJECT_ROOT
-    / "results"
-    / "cpc_alignment"
-    / "etm_patent_predictions_by_seed.csv"
-)
-
-K = 30
-EPOCHS = 200
-
-# 반드시 기존 seed 42 실행과 동일해야 합니다.
-BATCH_SIZE = 1024
-LEARNING_RATE = 2e-3
-
-# 권장:
-# 첫 번째 Colab 세션: [43]
-# 두 번째 Colab 세션: [44]
-#
-# 한 번에 모두 실행하려면 [43, 44]
-TRAIN_SEEDS = [43, 44]
-
-# 최종 평가는 저장된 seed 42 + 새 seed 43/44를 모두 사용
-EVAL_SEEDS = [42, 43, 44]
-
-# 저장된 theta가 있으면 해당 seed 학습을 건너뜁니다.
-SKIP_COMPLETED_SEEDS = True
-
-# 엄격한 재현성 설정
-DETERMINISTIC = True
-
-for directory in [CHECKPOINT_DIR, RESULT_DIR, LOG_DIR]:
-    directory.mkdir(parents=True, exist_ok=True)
-
-ERROR_LOG_PATH = LOG_DIR / "ecrtm_standalone_errors.txt"
-
-# ------------------------------------------------------------
-# 1. Google Drive mount
-# ------------------------------------------------------------
-
-from google.colab import drive
-
-drive.mount("/content/drive", force_remount=False)
-
-print("=" * 80)
-print("ECRTM STANDALONE RUNNER")
-print("=" * 80)
-print(f"Project root    : {PROJECT_ROOT}")
-print(f"Train seeds     : {TRAIN_SEEDS}")
-print(f"Evaluation seeds: {EVAL_SEEDS}")
-print(f"Topics          : {K}")
-print(f"Epochs          : {EPOCHS}")
-print(f"Batch size      : {BATCH_SIZE}")
-print("=" * 80)
-
-# ------------------------------------------------------------
-# 2. Install/import required packages
-# ------------------------------------------------------------
-
-required_packages = {
-    "topmost": "topmost",
-    "numpy": "numpy",
-    "pandas": "pandas",
-    "scipy": "scipy",
-    "sklearn": "scikit-learn",
-    "tqdm": "tqdm",
-}
-
-missing_packages = []
-
-for import_name, pip_name in required_packages.items():
-    try:
-        importlib.import_module(import_name)
-    except ImportError:
-        missing_packages.append(pip_name)
-
-if missing_packages:
-    print("Installing:", missing_packages)
-
-    subprocess.check_call(
-        [
+    if missing:
+        print("[INSTALL]", " ".join(missing))
+        subprocess.check_call([
             sys.executable,
             "-m",
             "pip",
             "install",
             "-q",
-            *missing_packages,
-        ]
-    )
+            "--upgrade",
+            *missing,
+        ])
+
+install_required_packages()
 
 import numpy as np
 import pandas as pd
-import scipy
+import scipy.sparse as sp
 import torch
-import topmost
 
-from scipy import sparse
+from tqdm.auto import tqdm
 from sklearn.metrics import normalized_mutual_info_score
 
-print("\n=== ENVIRONMENT ===")
-print("Python :", sys.version.split()[0])
-print("PyTorch:", torch.__version__)
-print("NumPy  :", np.__version__)
-print("SciPy  :", scipy.__version__)
-print("TopMost:", getattr(topmost, "__version__", "unknown"))
+from topmost import ECRTM
+from topmost.preprocess.preprocess import Preprocess
 
+# --------------------------------------------------------------------------------------
+# 1. Experiment configuration
+# --------------------------------------------------------------------------------------
+SEEDS = [42, 43, 44]
+NUM_TOPICS = 30
+
+VOCAB_SIZE = 8000
+MIN_DOC_COUNT = 10
+MAX_DOC_FREQ = 0.70
+
+# Official ECRTM-style training
+EPOCHS = 500
+BATCH_SIZE = 200
+LEARNING_RATE = 0.002
+LR_STEP_SIZE = 125
+LR_GAMMA = 0.5
+
+# Official TopMost ECRTM defaults
+ENCODER_UNITS = 200
+DROPOUT = 0.0
+EMBED_SIZE = 200
+BETA_TEMP = 0.2
+WEIGHT_LOSS_ECR = 100.0
+SINKHORN_ALPHA = 20.0
+SINKHORN_MAX_ITER = 1000
+
+CHECKPOINT_INTERVAL = 25
+INFERENCE_BATCH_SIZE = 512
+NUM_TOP_WORDS = 25
+
+EXPECTED_TEST_PATENTS = 9881
+EXPECTED_SECTIONS = 9
+EXPECTED_CLASSES = 121
+EXPECTED_SUBCLASSES = 466
+
+DEVICE = torch.device("cuda:0")
+
+# --------------------------------------------------------------------------------------
+# 2. GPU and reproducibility
+# --------------------------------------------------------------------------------------
 if not torch.cuda.is_available():
     raise RuntimeError(
-        "CUDA GPU를 찾지 못했습니다. "
-        "Colab 런타임 유형에서 GPU를 활성화하세요."
+        "CUDA GPU가 없습니다. Colab 런타임 유형을 NVIDIA T4 GPU로 설정하세요."
     )
 
-device = torch.device("cuda")
-
-print("Device :", device)
-print("GPU    :", torch.cuda.get_device_name(0))
-print(
-    "GPU RAM:",
-    f"{torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GiB",
+GPU_NAME = torch.cuda.get_device_name(0)
+GPU_MEMORY_GIB = (
+    torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
 )
 
-# ------------------------------------------------------------
-# 3. Reproducibility
-# ------------------------------------------------------------
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
 
-def set_all_seeds(seed):
+if hasattr(torch.backends.cuda.matmul, "allow_tf32"):
+    torch.backends.cuda.matmul.allow_tf32 = False
+
+if hasattr(torch.backends.cudnn, "allow_tf32"):
+    torch.backends.cudnn.allow_tf32 = False
+
+def set_seed(seed):
     os.environ["PYTHONHASHSEED"] = str(seed)
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
     random.seed(seed)
     np.random.seed(seed)
@@ -171,1454 +146,1540 @@ def set_all_seeds(seed):
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    if DETERMINISTIC:
-        torch.backends.cudnn.benchmark = False
-        torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
 
-        # seed 42와 동일한 설정이 우선입니다.
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.backends.cudnn.allow_tf32 = False
+set_seed(42)
 
-        torch.use_deterministic_algorithms(
-            True,
-            warn_only=True,
-        )
+print("=" * 100)
+print("ECRTM 3-SEED CPC BENCHMARK")
+print("=" * 100)
+print(f"GPU                     : {GPU_NAME}")
+print(f"GPU memory              : {GPU_MEMORY_GIB:.2f} GiB")
+print(f"PyTorch                 : {torch.__version__}")
+print(f"Device                  : {DEVICE}")
+print(f"Seeds                   : {SEEDS}")
+print(f"Topics                  : {NUM_TOPICS}")
+print(f"Vocabulary              : {VOCAB_SIZE:,}")
+print(f"Epochs                  : {EPOCHS}")
+print(f"Batch size              : {BATCH_SIZE}")
+print(f"Learning rate           : {LEARNING_RATE}")
+print(f"LR step/gamma           : {LR_STEP_SIZE} / {LR_GAMMA}")
+print(f"Encoder units           : {ENCODER_UNITS}")
+print(f"Embedding               : GloVe 200d")
+print(f"Beta temperature        : {BETA_TEMP}")
+print(f"ECR weight              : {WEIGHT_LOSS_ECR}")
+print(f"Sinkhorn alpha          : {SINKHORN_ALPHA}")
+print(f"Sinkhorn max iterations : {SINKHORN_MAX_ITER}")
+print(f"Mixed precision         : False")
+print(f"Checkpoint interval     : {CHECKPOINT_INTERVAL}")
+print("=" * 100)
 
+# --------------------------------------------------------------------------------------
+# 3. Verified Google Drive mount
+# --------------------------------------------------------------------------------------
+from google.colab import drive
 
-# ------------------------------------------------------------
-# 4. Validate input files
-# ------------------------------------------------------------
+def contains_test_records(project_root):
+    project_root = Path(project_root)
 
-required_files = [
-    TRAIN_BOW_PATH,
-    TEST_BOW_PATH,
-    VOCAB_PATH,
+    if not project_root.exists():
+        return False
+
+    preferred = (
+        project_root
+        / "data"
+        / "processed"
+        / "test_records.pkl"
+    )
+
+    if preferred.is_file():
+        return True
+
+    try:
+        return next(
+            project_root.rglob("test_records.pkl"),
+            None,
+        ) is not None
+    except Exception:
+        return False
+
+existing_candidates = [
+    Path("/content/depth_ot_evaluation_drive/MyDrive/depth_ot_patent"),
+    Path("/content/ecrtm_drive/MyDrive/depth_ot_patent"),
+    Path("/content/fastopic_drive/MyDrive/depth_ot_patent"),
+    Path("/content/gdrive/MyDrive/depth_ot_patent"),
+    Path("/content/drive/MyDrive/depth_ot_patent"),
 ]
 
-for path in required_files:
-    if not path.exists():
-        raise FileNotFoundError(f"필수 파일이 없습니다: {path}")
+PROJECT_ROOT = None
+MY_DRIVE = None
 
-train_bow = sparse.load_npz(TRAIN_BOW_PATH).tocsr()
-test_bow = sparse.load_npz(TEST_BOW_PATH).tocsr()
+for candidate in existing_candidates:
+    if contains_test_records(candidate):
+        PROJECT_ROOT = candidate
+        MY_DRIVE = candidate.parents[1]
+        print(f"[VERIFIED EXISTING MOUNT] {candidate}")
+        break
 
-if train_bow.shape[1] != test_bow.shape[1]:
-    raise ValueError(
-        f"Train/test vocabulary dimension mismatch: "
-        f"train={train_bow.shape}, test={test_bow.shape}"
-    )
+if PROJECT_ROOT is None:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    DRIVE_MOUNT = Path(f"/content/ecrtm_drive_{stamp}")
 
-if not np.isfinite(train_bow.data).all():
-    raise ValueError("Train BoW에 NaN 또는 Inf가 있습니다.")
+    print(f"[MOUNT] Google Drive → {DRIVE_MOUNT}")
+    drive.mount(str(DRIVE_MOUNT), force_remount=False)
 
-if not np.isfinite(test_bow.data).all():
-    raise ValueError("Test BoW에 NaN 또는 Inf가 있습니다.")
+    MY_DRIVE = DRIVE_MOUNT / "MyDrive"
 
-if train_bow.data.size and train_bow.data.min() < 0:
-    raise ValueError("Train BoW에 음수가 있습니다.")
+    if not MY_DRIVE.is_dir():
+        raise RuntimeError(
+            f"MyDrive를 찾을 수 없습니다: {MY_DRIVE}"
+        )
 
-if test_bow.data.size and test_bow.data.min() < 0:
-    raise ValueError("Test BoW에 음수가 있습니다.")
+    direct_project = MY_DRIVE / "depth_ot_patent"
 
-with open(VOCAB_PATH, "rb") as file:
-    vocab_object = pickle.load(file)
-
-if isinstance(vocab_object, dict):
-    if all(isinstance(value, (int, np.integer))
-           for value in vocab_object.values()):
-        vocab = [
-            token
-            for token, index in sorted(
-                vocab_object.items(),
-                key=lambda item: int(item[1]),
-            )
-        ]
+    if contains_test_records(direct_project):
+        PROJECT_ROOT = direct_project
     else:
-        vocab = list(vocab_object.keys())
-else:
-    vocab = list(vocab_object)
+        print("[SEARCH] MyDrive에서 depth_ot_patent 프로젝트 검색")
 
-vocab = [str(token) for token in vocab]
+        candidates = []
 
-if len(vocab) != train_bow.shape[1]:
-    raise ValueError(
-        f"Vocabulary length mismatch: "
-        f"vocab={len(vocab)}, bow={train_bow.shape[1]}"
-    )
+        for test_path in MY_DRIVE.rglob("test_records.pkl"):
+            for parent in test_path.parents:
+                if parent.name == "depth_ot_patent":
+                    candidates.append(parent)
+                    break
 
-print("\n=== DATA ===")
-print(
-    f"Train: {train_bow.shape}, "
-    f"nnz={train_bow.nnz:,}"
-)
-print(
-    f"Test : {test_bow.shape}, "
-    f"nnz={test_bow.nnz:,}"
-)
-print(f"Vocab: {len(vocab):,}")
-
-# ------------------------------------------------------------
-# 5. Prepare a TopMost-compatible data directory
-# ------------------------------------------------------------
-
-TOPMOST_DATA_DIR = Path("/content/topmost_patent_data")
-TOPMOST_DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-topmost_train_path = TOPMOST_DATA_DIR / "train_bow.npz"
-topmost_test_path = TOPMOST_DATA_DIR / "test_bow.npz"
-topmost_vocab_path = TOPMOST_DATA_DIR / "vocab.txt"
-
-for source, destination in [
-    (TRAIN_BOW_PATH, topmost_train_path),
-    (TEST_BOW_PATH, topmost_test_path),
-]:
-    if destination.exists() or destination.is_symlink():
-        destination.unlink()
-
-    os.symlink(source, destination)
-
-with open(topmost_vocab_path, "w", encoding="utf-8") as file:
-    for token in vocab:
-        file.write(token.replace("\n", " ") + "\n")
-
-# ------------------------------------------------------------
-# 6. Construct TopMost BasicDataset
-# ------------------------------------------------------------
-
-def get_basic_dataset_class():
-    if hasattr(topmost, "BasicDataset"):
-        return topmost.BasicDataset
-
-    if hasattr(topmost, "data") and hasattr(
-        topmost.data,
-        "BasicDataset",
-    ):
-        return topmost.data.BasicDataset
-
-    try:
-        from topmost.data import BasicDataset
-        return BasicDataset
-    except ImportError as error:
-        raise ImportError(
-            "설치된 TopMost에서 BasicDataset을 찾지 못했습니다."
-        ) from error
-
-
-def make_topmost_dataset():
-    dataset_class = get_basic_dataset_class()
-    signature = inspect.signature(dataset_class)
-
-    kwargs = {}
-
-    if "batch_size" in signature.parameters:
-        kwargs["batch_size"] = BATCH_SIZE
-
-    if "device" in signature.parameters:
-        kwargs["device"] = device
-
-    if "read_labels" in signature.parameters:
-        kwargs["read_labels"] = False
-
-    if "as_tensor" in signature.parameters:
-        kwargs["as_tensor"] = True
-
-    path_parameter = None
-
-    for candidate in [
-        "dataset_dir",
-        "data_dir",
-        "path",
-        "root",
-    ]:
-        if candidate in signature.parameters:
-            path_parameter = candidate
-            break
-
-    if path_parameter is not None:
-        kwargs[path_parameter] = str(TOPMOST_DATA_DIR)
-        dataset = dataset_class(**kwargs)
-    else:
-        dataset = dataset_class(
-            str(TOPMOST_DATA_DIR),
-            **kwargs,
-        )
-
-    return dataset
-
-
-print("\nConstructing TopMost dataset...")
-tm_dataset = make_topmost_dataset()
-
-print("[PASS] TopMost dataset constructed.")
-print(
-    "TopMost vocab size:",
-    getattr(tm_dataset, "vocab_size", "unknown"),
-)
-
-if int(tm_dataset.vocab_size) != len(vocab):
-    raise ValueError(
-        f"TopMost vocab mismatch: "
-        f"{tm_dataset.vocab_size} != {len(vocab)}"
-    )
-
-# 원본 sparse matrix는 평가용 non-empty mask만 남기고 정리
-test_nonempty_mask = np.asarray(
-    test_bow.getnnz(axis=1) > 0
-).reshape(-1)
-
-number_of_test_claims = test_bow.shape[0]
-
-del train_bow
-gc.collect()
-
-# ------------------------------------------------------------
-# 7. Checkpoint helpers
-# ------------------------------------------------------------
-
-def theta_pkl_path(seed):
-    return (
-        CHECKPOINT_DIR
-        / f"ecrtm_seed{seed}_theta_test.pkl"
-    )
-
-
-def theta_npy_path(seed):
-    return (
-        CHECKPOINT_DIR
-        / f"ecrtm_seed{seed}_theta_test.npy"
-    )
-
-
-def topwords_path(seed):
-    return (
-        CHECKPOINT_DIR
-        / f"ecrtm_seed{seed}_topwords.pkl"
-    )
-
-
-def model_path(seed):
-    return (
-        CHECKPOINT_DIR
-        / f"ecrtm_seed{seed}_model.pt"
-    )
-
-
-def atomic_pickle_save(value, path):
-    path = Path(path)
-    temporary_path = path.with_suffix(path.suffix + ".tmp")
-
-    with open(temporary_path, "wb") as file:
-        pickle.dump(
-            value,
-            file,
-            protocol=pickle.HIGHEST_PROTOCOL,
-        )
-
-    os.replace(temporary_path, path)
-
-
-def atomic_numpy_save(value, path):
-    path = Path(path)
-    temporary_path = path.with_suffix(".tmp.npy")
-
-    np.save(temporary_path, value)
-    os.replace(temporary_path, path)
-
-
-def load_saved_theta(seed):
-    npy_path = theta_npy_path(seed)
-    pkl_path = theta_pkl_path(seed)
-
-    if npy_path.exists():
-        theta = np.load(
-            npy_path,
-            mmap_mode=None,
-        )
-
-    elif pkl_path.exists():
-        with open(pkl_path, "rb") as file:
-            theta = pickle.load(file)
-
-    else:
-        raise FileNotFoundError(
-            f"Seed {seed} theta가 없습니다."
-        )
-
-    if isinstance(theta, dict):
-        for key in [
-            "theta",
-            "test_theta",
-            "theta_test",
-            "data",
-        ]:
-            if key in theta:
-                theta = theta[key]
-                break
-
-    if torch.is_tensor(theta):
-        theta = theta.detach().cpu().numpy()
-
-    theta = np.asarray(theta, dtype=np.float32)
-
-    if theta.ndim != 2:
-        raise ValueError(
-            f"Seed {seed}: theta가 2차원이 아닙니다: "
-            f"{theta.shape}"
-        )
-
-    if theta.shape != (number_of_test_claims, K):
-        raise ValueError(
-            f"Seed {seed}: theta shape mismatch: "
-            f"expected={(number_of_test_claims, K)}, "
-            f"actual={theta.shape}"
-        )
-
-    if not np.isfinite(theta).all():
-        raise ValueError(
-            f"Seed {seed}: theta에 NaN/Inf가 있습니다."
-        )
-
-    if theta.min() < -1e-7:
-        raise ValueError(
-            f"Seed {seed}: theta에 음수가 있습니다."
-        )
-
-    theta = np.maximum(theta, 0.0)
-
-    row_sums = theta.sum(axis=1, keepdims=True)
-    valid_rows = row_sums[:, 0] > 0
-
-    theta[valid_rows] /= row_sums[valid_rows]
-
-    if (~valid_rows).any():
-        theta[~valid_rows] = 1.0 / K
-
-    return theta
-
-
-# ------------------------------------------------------------
-# 8. Locate TopMost model/trainer classes
-# ------------------------------------------------------------
-
-def get_ecrtm_class():
-    if hasattr(topmost, "ECRTM"):
-        return topmost.ECRTM
-
-    if (
-        hasattr(topmost, "models")
-        and hasattr(topmost.models, "ECRTM")
-    ):
-        return topmost.models.ECRTM
-
-    raise ImportError(
-        "설치된 TopMost에서 ECRTM을 찾지 못했습니다."
-    )
-
-
-def get_basic_trainer_class():
-    if hasattr(topmost, "BasicTrainer"):
-        return topmost.BasicTrainer
-
-    if (
-        hasattr(topmost, "trainers")
-        and hasattr(topmost.trainers, "BasicTrainer")
-    ):
-        return topmost.trainers.BasicTrainer
-
-    raise ImportError(
-        "설치된 TopMost에서 BasicTrainer를 찾지 못했습니다."
-    )
-
-
-ECRTMClass = get_ecrtm_class()
-BasicTrainerClass = get_basic_trainer_class()
-
-# ------------------------------------------------------------
-# 9. Train only unfinished seeds
-# ------------------------------------------------------------
-
-training_records = []
-failed_seeds = []
-
-for seed in TRAIN_SEEDS:
-    print("\n" + "=" * 80)
-    print(f"ECRTM SEED {seed}")
-    print("=" * 80)
-
-    if (
-        SKIP_COMPLETED_SEEDS
-        and (
-            theta_npy_path(seed).exists()
-            or theta_pkl_path(seed).exists()
-        )
-    ):
-        print(
-            f"[SKIP] Seed {seed} theta가 이미 존재합니다."
-        )
-
-        # 저장 파일이 실제로 정상인지 검증
-        theta_check = load_saved_theta(seed)
-
-        print(
-            f"[PASS] Existing theta: "
-            f"shape={theta_check.shape}"
-        )
-
-        del theta_check
-        continue
-
-    set_all_seeds(seed)
-
-    model = None
-    trainer = None
-
-    try:
-        torch.cuda.empty_cache()
-
-        model = ECRTMClass(
-            tm_dataset.vocab_size,
-            num_topics=K,
-        ).to(device)
-
-        trainer = BasicTrainerClass(
-            model,
-            tm_dataset,
-            epochs=EPOCHS,
-            learning_rate=LEARNING_RATE,
-            batch_size=BATCH_SIZE,
-            verbose=True,
-        )
-
-        started_at = time.time()
-
-        top_words, _ = trainer.train()
-
-        training_seconds = time.time() - started_at
-
-        print(
-            f"\nSeed {seed} training took "
-            f"{training_seconds / 3600:.2f} hours."
-        )
-
-        print("Inferring test theta...")
-        test_theta = trainer.test(
-            tm_dataset.test_data
-        )
-
-        if torch.is_tensor(test_theta):
-            test_theta = (
-                test_theta
-                .detach()
-                .cpu()
-                .numpy()
-            )
-
-        test_theta = np.asarray(
-            test_theta,
-            dtype=np.float32,
-        )
-
-        if test_theta.shape != (
-            number_of_test_claims,
-            K,
-        ):
-            raise ValueError(
-                f"Seed {seed}: test theta shape mismatch: "
-                f"{test_theta.shape}"
-            )
-
-        if not np.isfinite(test_theta).all():
-            raise FloatingPointError(
-                f"Seed {seed}: theta에 NaN/Inf가 있습니다."
-            )
-
-        test_theta = np.maximum(
-            test_theta,
-            0.0,
-        )
-
-        theta_sums = test_theta.sum(
-            axis=1,
-            keepdims=True,
-        )
-
-        valid_theta_rows = theta_sums[:, 0] > 0
-
-        test_theta[valid_theta_rows] /= (
-            theta_sums[valid_theta_rows]
-        )
-
-        if (~valid_theta_rows).any():
-            test_theta[~valid_theta_rows] = 1.0 / K
-
-        atomic_numpy_save(
-            test_theta,
-            theta_npy_path(seed),
-        )
-
-        atomic_pickle_save(
-            test_theta,
-            theta_pkl_path(seed),
-        )
-
-        atomic_pickle_save(
-            top_words,
-            topwords_path(seed),
-        )
-
-        torch.save(
-            {
-                "seed": seed,
-                "num_topics": K,
-                "epochs": EPOCHS,
-                "batch_size": BATCH_SIZE,
-                "learning_rate": LEARNING_RATE,
-                "model_state_dict": model.state_dict(),
-            },
-            model_path(seed),
-        )
-
-        training_record = {
-            "seed": seed,
-            "status": "completed",
-            "training_seconds": training_seconds,
-            "theta_shape": list(test_theta.shape),
-            "theta_min": float(test_theta.min()),
-            "theta_max": float(test_theta.max()),
-            "mean_row_sum": float(
-                test_theta.sum(axis=1).mean()
-            ),
-        }
-
-        training_records.append(training_record)
-
-        print(f"[SAVED] {theta_npy_path(seed)}")
-        print(f"[SAVED] {theta_pkl_path(seed)}")
-        print(f"[SAVED] {topwords_path(seed)}")
-        print(f"[SAVED] {model_path(seed)}")
-
-    except KeyboardInterrupt:
-        print(
-            f"\n[INTERRUPTED] Seed {seed} 학습이 중단되었습니다."
-        )
-        print(
-            "TopMost BasicTrainer는 epoch 중간 resume를 "
-            "지원하지 않으므로 이 seed는 다음 실행에서 "
-            "처음부터 다시 시작됩니다."
-        )
-        raise
-
-    except Exception as error:
-        failed_seeds.append(seed)
-
-        error_message = (
-            f"Seed {seed} failed: {error}\n"
-            f"{traceback.format_exc()}\n"
-        )
-
-        print(error_message)
-
-        with open(
-            ERROR_LOG_PATH,
-            "a",
-            encoding="utf-8",
-        ) as file:
-            file.write(error_message + "\n")
-
-    finally:
-        if trainer is not None:
-            del trainer
-
-        if model is not None:
-            del model
-
-        gc.collect()
-        torch.cuda.empty_cache()
-
-# ------------------------------------------------------------
-# 10. Patent/claim mapping
-# ------------------------------------------------------------
-
-def load_pickle(path):
-    with open(path, "rb") as file:
-        return pickle.load(file)
-
-
-def extract_record_patent_ids(records):
-    candidate_columns = [
-        "patent_id",
-        "publication_number",
-        "publication_id",
-        "doc_id",
-        "document_id",
-        "id",
-    ]
-
-    if isinstance(records, pd.DataFrame):
-        for column in candidate_columns:
-            if column in records.columns:
-                return records[column].astype(str).to_numpy()
-
-    if isinstance(records, dict):
-        for column in candidate_columns:
-            if column in records:
-                values = np.asarray(records[column])
-
-                if values.ndim == 1:
-                    return values.astype(str)
-
-        for key in ["records", "data", "items"]:
-            if key in records:
-                return extract_record_patent_ids(
-                    records[key]
-                )
-
-    if isinstance(records, (list, tuple, np.ndarray)):
-        records_list = list(records)
-
-        if not records_list:
-            raise ValueError("test_records가 비어 있습니다.")
-
-        first = records_list[0]
-
-        if isinstance(first, dict):
-            for column in candidate_columns:
-                if column in first:
-                    return np.asarray(
-                        [
-                            str(record[column])
-                            for record in records_list
-                        ]
-                    )
-
-        if isinstance(first, (str, int, np.integer)):
-            return np.asarray(
-                records_list,
-                dtype=str,
-            )
-
-    raise ValueError(
-        "test_records에서 patent ID를 찾지 못했습니다."
-    )
-
-
-def collect_reference_candidates(obj, expected_length):
-    candidates = []
-
-    if isinstance(obj, pd.DataFrame):
-        for column in obj.columns:
-            values = obj[column].to_numpy()
-
-            if len(values) == expected_length:
-                candidates.append(
-                    (f"column:{column}", values)
-                )
-
-    elif isinstance(obj, dict):
-        priority_keys = [
-            "patent_idx",
-            "patent_index",
-            "record_idx",
-            "record_index",
-            "claim_to_patent",
-            "claim_patent_idx",
-            "references",
-            "ref",
-            "indices",
-            "patent_id",
-            "patent_ids",
-        ]
-
-        for key in priority_keys:
-            if key in obj:
-                values = np.asarray(obj[key])
-
-                if (
-                    values.ndim == 1
-                    and len(values) == expected_length
-                ):
-                    candidates.append(
-                        (f"key:{key}", values)
-                    )
-
-        for key, value in obj.items():
-            values = np.asarray(value)
-
-            if (
-                values.ndim == 1
-                and len(values) == expected_length
-            ):
-                candidates.append(
-                    (f"key:{key}", values)
-                )
-
-    else:
-        values = np.asarray(obj, dtype=object)
-
-        if (
-            values.ndim == 1
-            and len(values) == expected_length
-        ):
-            candidates.append(("array", values))
-
-        elif (
-            values.ndim == 2
-            and values.shape[0] == expected_length
-        ):
-            for column_index in range(values.shape[1]):
-                candidates.append(
-                    (
-                        f"array-column:{column_index}",
-                        values[:, column_index],
-                    )
-                )
-
-    return candidates
-
-
-def create_claim_patent_ids(
-    ref_test,
-    record_patent_ids,
-    expected_length,
-):
-    candidates = collect_reference_candidates(
-        ref_test,
-        expected_length,
-    )
-
-    if not candidates:
-        raise ValueError(
-            "ref_test에서 claim-to-patent mapping을 "
-            "찾지 못했습니다."
-        )
-
-    number_of_patents = len(record_patent_ids)
-    patent_id_set = set(
-        record_patent_ids.astype(str)
-    )
-
-    for candidate_name, candidate in candidates:
-        candidate_array = np.asarray(candidate)
-
-        # 정수 index mapping 확인
-        try:
-            numeric = candidate_array.astype(np.int64)
-
-            if (
-                numeric.min() >= 0
-                and numeric.max() < number_of_patents
-            ):
-                print(
-                    f"Reference mapping: "
-                    f"{candidate_name}, zero-based"
-                )
-
-                return (
-                    record_patent_ids[numeric],
-                    "zero-based",
-                )
-
-            if (
-                numeric.min() >= 1
-                and numeric.max() <= number_of_patents
-            ):
-                print(
-                    f"Reference mapping: "
-                    f"{candidate_name}, one-based"
-                )
-
-                return (
-                    record_patent_ids[numeric - 1],
-                    "one-based",
-                )
-
-        except (ValueError, TypeError, OverflowError):
-            pass
-
-        # 직접 patent ID mapping 확인
-        candidate_strings = candidate_array.astype(str)
-
-        matched_fraction = np.mean(
-            [
-                value in patent_id_set
-                for value in candidate_strings
-            ]
-        )
-
-        if matched_fraction > 0.95:
-            print(
-                f"Reference mapping: "
-                f"{candidate_name}, direct patent ID"
-            )
-
-            return (
-                candidate_strings,
-                "direct-patent-id",
-            )
-
-    raise ValueError(
-        "ref_test mapping 후보를 patent record와 "
-        "연결하지 못했습니다."
-    )
-
-
-if not TEST_RECORDS_PATH.exists():
-    raise FileNotFoundError(
-        f"test_records 파일이 없습니다: "
-        f"{TEST_RECORDS_PATH}"
-    )
-
-if not REF_TEST_PATH.exists():
-    raise FileNotFoundError(
-        f"ref_test 파일이 없습니다: {REF_TEST_PATH}"
-    )
-
-test_records = load_pickle(TEST_RECORDS_PATH)
-ref_test = load_pickle(REF_TEST_PATH)
-
-record_patent_ids = extract_record_patent_ids(
-    test_records
-)
-
-claim_patent_ids, reference_type = (
-    create_claim_patent_ids(
-        ref_test,
-        record_patent_ids,
-        number_of_test_claims,
-    )
-)
-
-claim_patent_ids = np.asarray(
-    claim_patent_ids,
-    dtype=str,
-)
-
-if len(claim_patent_ids) != number_of_test_claims:
-    raise ValueError(
-        f"Claim mapping length mismatch: "
-        f"{len(claim_patent_ids)} != "
-        f"{number_of_test_claims}"
-    )
-
-print("\n=== CLAIM/PATENT MAPPING ===")
-print(f"Patent records : {len(record_patent_ids):,}")
-print(f"Test claims    : {len(claim_patent_ids):,}")
-print(
-    f"Unique patents: "
-    f"{len(np.unique(claim_patent_ids)):,}"
-)
-print(f"Reference type : {reference_type}")
-print(
-    f"Empty claims   : "
-    f"{np.sum(~test_nonempty_mask):,}"
-)
-
-# ------------------------------------------------------------
-# 11. Load CPC reference labels
-# ------------------------------------------------------------
-
-def normalize_cpc_reference(frame):
-    frame = frame.copy()
-
-    lowercase_mapping = {
-        str(column).lower(): column
-        for column in frame.columns
-    }
-
-    aliases = {
-        "patent_id": [
-            "patent_id",
-            "publication_number",
-            "publication_id",
-            "doc_id",
-            "document_id",
-        ],
-        "section": [
-            "section",
-            "cpc_section",
-        ],
-        "class": [
-            "class",
-            "cpc_class",
-        ],
-        "subclass": [
-            "subclass",
-            "cpc_subclass",
-        ],
-    }
-
-    rename_mapping = {}
-
-    for target, candidates in aliases.items():
-        found_column = None
+        unique_candidates = []
+        seen = set()
 
         for candidate in candidates:
-            if candidate in lowercase_mapping:
-                found_column = lowercase_mapping[candidate]
-                break
+            key = str(candidate.resolve())
+            if key not in seen:
+                seen.add(key)
+                unique_candidates.append(candidate)
 
-        if found_column is None:
-            raise ValueError(
-                f"CPC reference에 {target} 열이 없습니다. "
-                f"Columns={list(frame.columns)}"
+        if not unique_candidates:
+            raise FileNotFoundError(
+                "MyDrive에서 test_records.pkl이 포함된 "
+                "depth_ot_patent 프로젝트를 찾지 못했습니다."
             )
 
-        rename_mapping[found_column] = target
+        PROJECT_ROOT = unique_candidates[0]
 
-    frame = frame.rename(
-        columns=rename_mapping
+if not contains_test_records(PROJECT_ROOT):
+    raise RuntimeError(
+        f"프로젝트 검증 실패: {PROJECT_ROOT}"
     )
 
-    frame = frame[
-        [
-            "patent_id",
-            "section",
-            "class",
-            "subclass",
+print(f"[PROJECT ROOT VERIFIED] {PROJECT_ROOT}")
+
+# --------------------------------------------------------------------------------------
+# 4. File discovery
+# --------------------------------------------------------------------------------------
+def find_required_file(filename, preferred_paths=None):
+    preferred_paths = preferred_paths or []
+
+    for path in preferred_paths:
+        path = Path(path)
+        if path.is_file():
+            print(f"[FOUND] {filename}: {path}")
+            return path
+
+    matches = sorted(
+        p for p in PROJECT_ROOT.rglob(filename)
+        if p.is_file()
+    )
+
+    if len(matches) == 1:
+        print(f"[FOUND] {filename}: {matches[0]}")
+        return matches[0]
+
+    if len(matches) > 1:
+        processed = [
+            p for p in matches
+            if "data/processed" in str(p).replace("\\", "/")
         ]
-    ].copy()
 
-    frame["patent_id"] = (
-        frame["patent_id"].astype(str)
+        selected = processed[0] if processed else matches[0]
+
+        print(f"[WARNING] {filename} 후보가 여러 개입니다.")
+        for path in matches:
+            print("  ", path)
+        print(f"[SELECTED] {selected}")
+
+        return selected
+
+    # 프로젝트 경로 밖의 같은 Drive 검색
+    drive_matches = sorted(
+        p for p in MY_DRIVE.rglob(filename)
+        if p.is_file()
     )
 
-    for column in [
-        "section",
-        "class",
-        "subclass",
-    ]:
-        frame[column] = frame[column].astype(str)
+    if drive_matches:
+        selected = drive_matches[0]
+        print(f"[FOUND IN MYDRIVE] {filename}: {selected}")
+        return selected
 
-    # seed별 예측 파일이면 같은 patent가 여러 번 있을 수 있음
-    frame = frame.drop_duplicates(
-        subset=[
-            "patent_id",
-            "section",
-            "class",
-            "subclass",
-        ]
+    raise FileNotFoundError(
+        f"필수 파일을 찾을 수 없습니다: {filename}"
     )
 
-    # 한 patent에 동일한 정답 한 행만 유지
-    conflicting = (
-        frame.groupby("patent_id")[
-            ["section", "class", "subclass"]
-        ]
-        .nunique()
-        .max(axis=1)
-    )
+TRAIN_RECORD_PATH = find_required_file(
+    "train_records.pkl",
+    [
+        PROJECT_ROOT / "data" / "processed" / "train_records.pkl",
+        PROJECT_ROOT / "data" / "processed" / "records" / "train_records.pkl",
+    ],
+)
 
-    if (conflicting > 1).any():
-        raise ValueError(
-            "동일 patent_id에 서로 다른 CPC 정답이 있습니다."
+TEST_RECORD_PATH = find_required_file(
+    "test_records.pkl",
+    [
+        PROJECT_ROOT / "data" / "processed" / "test_records.pkl",
+        PROJECT_ROOT / "data" / "processed" / "records" / "test_records.pkl",
+    ],
+)
+
+if TRAIN_RECORD_PATH.stat().st_size == 0:
+    raise RuntimeError(f"빈 파일입니다: {TRAIN_RECORD_PATH}")
+
+if TEST_RECORD_PATH.stat().st_size == 0:
+    raise RuntimeError(f"빈 파일입니다: {TEST_RECORD_PATH}")
+
+# 고정 폴더를 사용해 Colab이 중단돼도 자동 resume
+RESULT_DIR = (
+    PROJECT_ROOT
+    / "results"
+    / "baselines"
+    / "ecrtm_k30_glove200_seeds_42_43_44"
+)
+
+CHECKPOINT_DIR = RESULT_DIR / "checkpoints"
+ARRAY_DIR = RESULT_DIR / "arrays"
+TOPIC_DIR = RESULT_DIR / "topics"
+
+# 전처리 데이터는 Drive에 저장하여 새 런타임에서도 재사용
+CACHE_DIR = (
+    PROJECT_ROOT
+    / "cache"
+    / "ecrtm_k30_trainonly_vocab8000"
+)
+
+for directory in [
+    RESULT_DIR,
+    CHECKPOINT_DIR,
+    ARRAY_DIR,
+    TOPIC_DIR,
+    CACHE_DIR,
+]:
+    directory.mkdir(parents=True, exist_ok=True)
+
+print("\n" + "=" * 100)
+print("VERIFIED ECRTM PATHS")
+print("=" * 100)
+print(f"MyDrive       : {MY_DRIVE}")
+print(f"Project root  : {PROJECT_ROOT}")
+print(f"Train records : {TRAIN_RECORD_PATH}")
+print(f"Test records  : {TEST_RECORD_PATH}")
+print(f"Result dir    : {RESULT_DIR}")
+print(f"Cache dir     : {CACHE_DIR}")
+print("=" * 100)
+
+# --------------------------------------------------------------------------------------
+# 5. Record loading
+# --------------------------------------------------------------------------------------
+def load_pickle_records(path):
+    with open(path, "rb") as f:
+        obj = pickle.load(f)
+
+    if isinstance(obj, list):
+        records = obj
+
+    elif isinstance(obj, tuple):
+        records = list(obj)
+
+    elif isinstance(obj, dict):
+        records = None
+
+        for key in ["records", "data", "items", "patents"]:
+            if key in obj and isinstance(obj[key], (list, tuple)):
+                records = list(obj[key])
+                break
+
+        if records is None:
+            if all(isinstance(v, dict) for v in obj.values()):
+                records = list(obj.values())
+            else:
+                raise TypeError(
+                    f"해석할 수 없는 dictionary 구조: "
+                    f"{list(obj.keys())[:30]}"
+                )
+    else:
+        raise TypeError(
+            f"지원되지 않는 pickle 타입: {type(obj)}"
         )
 
-    frame = frame.drop_duplicates(
-        subset=["patent_id"]
+    if not records:
+        raise RuntimeError(f"레코드가 비어 있습니다: {path}")
+
+    if not isinstance(records[0], dict):
+        raise TypeError(
+            f"각 record는 dict여야 합니다: {type(records[0])}"
+        )
+
+    return records
+
+print("[LOAD] Train records")
+train_records = load_pickle_records(TRAIN_RECORD_PATH)
+
+print("[LOAD] Test records")
+test_records = load_pickle_records(TEST_RECORD_PATH)
+
+print(f"[RECORDS] Train patents: {len(train_records):,}")
+print(f"[RECORDS] Test patents : {len(test_records):,}")
+print(f"[SAMPLE KEYS] {list(test_records[0].keys())}")
+
+if len(test_records) != EXPECTED_TEST_PATENTS:
+    print(
+        f"[WARNING] Expected test patents={EXPECTED_TEST_PATENTS:,}, "
+        f"found={len(test_records):,}"
     )
 
-    return frame
+# --------------------------------------------------------------------------------------
+# 6. Patent claim text extraction
+# --------------------------------------------------------------------------------------
+CLAIM_KEYS = [
+    "claims",
+    "claim_texts",
+    "claims_text",
+    "claim_records",
+    "claim_list",
+]
 
+CLAIM_TEXT_KEYS = [
+    "text",
+    "claim_text",
+    "clean_text",
+    "normalized_text",
+    "raw_text",
+    "content",
+]
 
-if not CPC_REFERENCE_PATH.exists():
-    raise FileNotFoundError(
-        "CPC reference 파일을 찾지 못했습니다:\n"
-        f"{CPC_REFERENCE_PATH}\n"
-        "경로가 다르면 코드 상단의 "
-        "CPC_REFERENCE_PATH를 수정하세요."
+def scalar_text(value):
+    if value is None:
+        return ""
+
+    if isinstance(value, str):
+        return value.strip()
+
+    if isinstance(value, (list, tuple)):
+        if all(isinstance(x, str) for x in value):
+            return " ".join(
+                x.strip() for x in value if x.strip()
+            )
+
+    return ""
+
+def claim_item_text(item):
+    if isinstance(item, str):
+        return item.strip()
+
+    if isinstance(item, dict):
+        for key in CLAIM_TEXT_KEYS:
+            if key in item:
+                text = scalar_text(item[key])
+                if text:
+                    return text
+
+        for key in ["tokens", "words"]:
+            if key in item and isinstance(item[key], (list, tuple)):
+                return " ".join(str(x) for x in item[key])
+
+    return ""
+
+def extract_patent_text(record):
+    for key in CLAIM_KEYS:
+        if key not in record:
+            continue
+
+        value = record[key]
+        texts = []
+
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                text = claim_item_text(item)
+                if text:
+                    texts.append(text)
+
+        elif isinstance(value, dict):
+            for item in value.values():
+                text = claim_item_text(item)
+                if text:
+                    texts.append(text)
+
+        elif isinstance(value, str):
+            texts.append(value.strip())
+
+        if texts:
+            return " ".join(texts)
+
+    for key in [
+        "patent_text",
+        "document",
+        "doc_text",
+        "full_text",
+        "text",
+        "content",
+    ]:
+        if key in record:
+            text = scalar_text(record[key])
+            if text:
+                return text
+
+    pieces = []
+
+    for key in ["title", "abstract", "summary"]:
+        if key in record:
+            text = scalar_text(record[key])
+            if text:
+                pieces.append(text)
+
+    return " ".join(pieces)
+
+def extract_patent_id(record, index):
+    for key in [
+        "patent_id",
+        "publication_number",
+        "patent_number",
+        "document_id",
+        "doc_id",
+        "id",
+    ]:
+        if key in record and record[key] is not None:
+            return str(record[key])
+
+    return f"record_{index:08d}"
+
+print("[TEXT] Extracting train patent documents")
+train_docs = [
+    extract_patent_text(record)
+    for record in train_records
+]
+
+print("[TEXT] Extracting test patent documents")
+test_docs = [
+    extract_patent_text(record)
+    for record in test_records
+]
+
+test_ids = [
+    extract_patent_id(record, i)
+    for i, record in enumerate(test_records)
+]
+
+empty_train = [
+    i for i, text in enumerate(train_docs)
+    if not text.strip()
+]
+empty_test = [
+    i for i, text in enumerate(test_docs)
+    if not text.strip()
+]
+
+if empty_train:
+    raise RuntimeError(
+        f"빈 train documents={len(empty_train):,}, "
+        f"sample={empty_train[:10]}"
     )
 
-cpc_reference = normalize_cpc_reference(
-    pd.read_csv(CPC_REFERENCE_PATH)
+if empty_test:
+    raise RuntimeError(
+        f"빈 test documents={len(empty_test):,}, "
+        f"sample={empty_test[:10]}"
+    )
+
+train_lengths = np.asarray([
+    len(text.split()) for text in train_docs
+])
+test_lengths = np.asarray([
+    len(text.split()) for text in test_docs
+])
+
+print(
+    f"[TRAIN TEXT] mean={train_lengths.mean():.1f}, "
+    f"median={np.median(train_lengths):.1f}, "
+    f"max={train_lengths.max():,}"
+)
+print(
+    f"[TEST TEXT] mean={test_lengths.mean():.1f}, "
+    f"median={np.median(test_lengths):.1f}, "
+    f"max={test_lengths.max():,}"
 )
 
-print("\n=== CPC REFERENCE ===")
-print(f"Path   : {CPC_REFERENCE_PATH}")
-print(f"Patents: {len(cpc_reference):,}")
-print(
-    "Sections:",
-    cpc_reference["section"].nunique(),
-)
-print(
-    "Classes:",
-    cpc_reference["class"].nunique(),
-)
-print(
-    "Subclasses:",
-    cpc_reference["subclass"].nunique(),
+# --------------------------------------------------------------------------------------
+# 7. CPC extraction
+# --------------------------------------------------------------------------------------
+CPC_PATTERN = re.compile(
+    r"\b([A-HY]\d{2}[A-Z])(?:\d+)?(?:/\d+)?\b",
+    re.I,
 )
 
-# ------------------------------------------------------------
-# 12. Patent-level aggregation
-# ------------------------------------------------------------
+def flatten_values(value):
+    if value is None:
+        return []
 
-def aggregate_claim_theta_to_patents(
-    claim_theta,
-    claim_to_patent_ids,
-    nonempty_mask,
+    if isinstance(value, str):
+        return [value]
+
+    if isinstance(value, (int, float)):
+        return [str(value)]
+
+    if isinstance(value, (list, tuple)):
+        output = []
+        for item in value:
+            output.extend(flatten_values(item))
+        return output
+
+    if isinstance(value, dict):
+        output = []
+        for item in value.values():
+            output.extend(flatten_values(item))
+        return output
+
+    return [str(value)]
+
+def find_cpc(value):
+    for item in flatten_values(value):
+        matches = CPC_PATTERN.findall(str(item).upper())
+        if matches:
+            return matches[0].upper()
+
+    return None
+
+def extract_cpc(record):
+    for key in [
+        "primary_cpc",
+        "main_cpc",
+        "first_cpc",
+        "cpc_primary",
+        "primary_cpc_code",
+    ]:
+        if key in record:
+            code = find_cpc(record[key])
+            if code:
+                return code
+
+    # 이미 전처리된 subclass field 우선 사용 가능
+    if "subclass" in record:
+        code = find_cpc(record["subclass"])
+        if code:
+            return code
+
+    for key in [
+        "cpc_codes",
+        "cpc",
+        "cpcs",
+        "cpc_labels",
+        "classifications",
+    ]:
+        if key in record:
+            code = find_cpc(record[key])
+            if code:
+                return code
+
+    return None
+
+test_cpc = [
+    extract_cpc(record)
+    for record in test_records
+]
+
+valid_cpc_mask = np.asarray([
+    code is not None for code in test_cpc
+])
+
+section_labels = np.asarray([
+    code[0] if code else ""
+    for code in test_cpc
+])
+class_labels = np.asarray([
+    code[:3] if code else ""
+    for code in test_cpc
+])
+subclass_labels = np.asarray([
+    code[:4] if code else ""
+    for code in test_cpc
+])
+
+num_sections = len(set(section_labels[valid_cpc_mask]))
+num_classes = len(set(class_labels[valid_cpc_mask]))
+num_subclasses = len(set(subclass_labels[valid_cpc_mask]))
+
+print(f"[CPC] Valid={valid_cpc_mask.sum():,}")
+print(
+    f"[CPC LABEL COUNTS] Section={num_sections}, "
+    f"Class={num_classes}, Subclass={num_subclasses}"
+)
+
+if (
+    num_sections != EXPECTED_SECTIONS
+    or num_classes != EXPECTED_CLASSES
+    or num_subclasses != EXPECTED_SUBCLASSES
 ):
-    claim_theta = np.asarray(
-        claim_theta,
+    raise RuntimeError(
+        "기존 표의 CPC label count와 일치하지 않습니다.\n"
+        f"Expected={EXPECTED_SECTIONS}/{EXPECTED_CLASSES}/"
+        f"{EXPECTED_SUBCLASSES}\n"
+        f"Found={num_sections}/{num_classes}/{num_subclasses}"
+    )
+
+# 레코드 원본은 더 이상 필요하지 않음
+del train_records
+del test_records
+gc.collect()
+
+# --------------------------------------------------------------------------------------
+# 8. Train-only vocabulary and sparse BoW
+# --------------------------------------------------------------------------------------
+TRAIN_BOW_PATH = CACHE_DIR / "train_bow.npz"
+TEST_BOW_PATH = CACHE_DIR / "test_bow.npz"
+VOCAB_PATH = CACHE_DIR / "vocabulary.json"
+GLOVE_PATH = CACHE_DIR / "glove200_embeddings.npy"
+CACHE_INFO_PATH = CACHE_DIR / "cache_information.json"
+
+def cache_is_valid():
+    required = [
+        TRAIN_BOW_PATH,
+        TEST_BOW_PATH,
+        VOCAB_PATH,
+    ]
+
+    if not all(path.exists() for path in required):
+        return False
+
+    try:
+        train_bow = sp.load_npz(TRAIN_BOW_PATH)
+        test_bow = sp.load_npz(TEST_BOW_PATH)
+
+        with open(VOCAB_PATH, "r", encoding="utf-8") as f:
+            vocab = json.load(f)
+
+        return (
+            train_bow.shape == (len(train_docs), VOCAB_SIZE)
+            and test_bow.shape == (len(test_docs), VOCAB_SIZE)
+            and len(vocab) == VOCAB_SIZE
+        )
+    except Exception:
+        return False
+
+if cache_is_valid():
+    print("[BOW CACHE HIT] Loading train/test sparse matrices")
+
+    train_bow = sp.load_npz(TRAIN_BOW_PATH).tocsr().astype(np.float32)
+    test_bow = sp.load_npz(TEST_BOW_PATH).tocsr().astype(np.float32)
+
+    with open(VOCAB_PATH, "r", encoding="utf-8") as f:
+        vocab = json.load(f)
+
+else:
+    print("[PREPROCESS] Building train-only vocabulary and BoW")
+    print(
+        f"Vocabulary={VOCAB_SIZE}, min_df={MIN_DOC_COUNT}, "
+        f"max_df={MAX_DOC_FREQ}"
+    )
+
+    preprocess = Preprocess(
+        vocab_size=VOCAB_SIZE,
+        min_doc_count=MIN_DOC_COUNT,
+        max_doc_freq=MAX_DOC_FREQ,
+        stopwords="English",
+        keep_num=False,
+        keep_alphanum=False,
+        min_length=3,
+        seed=42,
+        verbose=True,
+    )
+
+    # 중요: test 문서를 전달하지 않으므로 vocabulary는 train-only
+    train_rst = preprocess.preprocess(
+        train_docs,
+        pretrained_WE=False,
+    )
+
+    vocab = list(train_rst["vocab"])
+    train_bow = train_rst["train_bow"].tocsr().astype(np.float32)
+
+    if len(vocab) != VOCAB_SIZE:
+        raise RuntimeError(
+            f"Vocabulary size mismatch: "
+            f"expected={VOCAB_SIZE}, found={len(vocab)}"
+        )
+
+    print("[PREPROCESS] Parsing test documents with fixed train vocabulary")
+
+    _, test_bow = preprocess.parse(
+        test_docs,
+        vocab,
+    )
+    test_bow = test_bow.tocsr().astype(np.float32)
+
+    sp.save_npz(
+        TRAIN_BOW_PATH,
+        train_bow,
+        compressed=True,
+    )
+    sp.save_npz(
+        TEST_BOW_PATH,
+        test_bow,
+        compressed=True,
+    )
+
+    with open(VOCAB_PATH, "w", encoding="utf-8") as f:
+        json.dump(vocab, f, ensure_ascii=False)
+
+    cache_info = {
+        "created_at": datetime.now().isoformat(),
+        "train_records": str(TRAIN_RECORD_PATH),
+        "test_records": str(TEST_RECORD_PATH),
+        "train_shape": list(train_bow.shape),
+        "test_shape": list(test_bow.shape),
+        "vocab_size": len(vocab),
+        "min_doc_count": MIN_DOC_COUNT,
+        "max_doc_freq": MAX_DOC_FREQ,
+        "vocabulary_train_only": True,
+    }
+
+    with open(
+        CACHE_INFO_PATH,
+        "w",
+        encoding="utf-8",
+    ) as f:
+        json.dump(cache_info, f, indent=2, ensure_ascii=False)
+
+    del train_rst
+    del preprocess
+    gc.collect()
+
+if train_bow.shape != (len(train_docs), VOCAB_SIZE):
+    raise RuntimeError(
+        f"Unexpected train BoW shape: {train_bow.shape}"
+    )
+
+if test_bow.shape != (len(test_docs), VOCAB_SIZE):
+    raise RuntimeError(
+        f"Unexpected test BoW shape: {test_bow.shape}"
+    )
+
+print(f"[BOW] Train shape: {train_bow.shape}")
+print(f"[BOW] Test shape : {test_bow.shape}")
+print(
+    f"[BOW] Train average tokens: "
+    f"{train_bow.sum() / train_bow.shape[0]:.2f}"
+)
+print(
+    f"[BOW] Test average tokens : "
+    f"{test_bow.sum() / test_bow.shape[0]:.2f}"
+)
+
+# 원문은 BoW 생성 후 필요 없음
+del train_docs
+del test_docs
+gc.collect()
+
+# --------------------------------------------------------------------------------------
+# 9. GloVe 200d embeddings
+# --------------------------------------------------------------------------------------
+def load_or_build_glove(vocab):
+    if GLOVE_PATH.exists():
+        embeddings = np.load(GLOVE_PATH)
+
+        if embeddings.shape == (len(vocab), EMBED_SIZE):
+            print(
+                f"[GLOVE CACHE HIT] {GLOVE_PATH}, "
+                f"shape={embeddings.shape}"
+            )
+            return embeddings.astype(np.float32)
+
+        print(
+            f"[GLOVE CACHE INVALID] {embeddings.shape}"
+        )
+
+    print("[GLOVE] Downloading/loading glove-wiki-gigaword-200")
+    print("[GLOVE] 최초 실행 시 약 250 MiB 다운로드가 필요합니다.")
+
+    import gensim.downloader as api
+
+    glove = api.load("glove-wiki-gigaword-200")
+
+    embeddings = np.zeros(
+        (len(vocab), EMBED_SIZE),
         dtype=np.float32,
     )
 
-    valid_mask = (
-        np.asarray(nonempty_mask, dtype=bool)
-        & np.isfinite(claim_theta).all(axis=1)
-        & (claim_theta.sum(axis=1) > 0)
+    found = 0
+
+    for index, word in enumerate(
+        tqdm(vocab, desc="Mapping GloVe embeddings")
+    ):
+        if word in glove.key_to_index:
+            embeddings[index] = glove[word]
+            found += 1
+
+    np.save(GLOVE_PATH, embeddings)
+
+    print(
+        f"[GLOVE] Found={found:,}/{len(vocab):,} "
+        f"({found / len(vocab):.2%})"
+    )
+    print(f"[GLOVE SAVED] {GLOVE_PATH}")
+
+    del glove
+    gc.collect()
+
+    return embeddings
+
+pretrained_word_embeddings = load_or_build_glove(vocab)
+
+if pretrained_word_embeddings.shape != (VOCAB_SIZE, EMBED_SIZE):
+    raise RuntimeError(
+        f"Unexpected GloVe shape: "
+        f"{pretrained_word_embeddings.shape}"
     )
 
-    valid_theta = claim_theta[valid_mask]
-    valid_patent_ids = np.asarray(
-        claim_to_patent_ids,
-        dtype=str,
-    )[valid_mask]
+# --------------------------------------------------------------------------------------
+# 10. CPC metrics
+# --------------------------------------------------------------------------------------
+def predicted_cluster_purity(true_labels, predicted_clusters):
+    true_labels = np.asarray(true_labels)
+    predicted_clusters = np.asarray(predicted_clusters)
 
-    patent_ids, inverse_indices = np.unique(
-        valid_patent_ids,
-        return_inverse=True,
-    )
+    correct = 0
 
-    patent_theta = np.zeros(
-        (len(patent_ids), claim_theta.shape[1]),
-        dtype=np.float64,
-    )
-
-    counts = np.zeros(
-        len(patent_ids),
-        dtype=np.int64,
-    )
-
-    np.add.at(
-        patent_theta,
-        inverse_indices,
-        valid_theta,
-    )
-
-    np.add.at(
-        counts,
-        inverse_indices,
-        1,
-    )
-
-    patent_theta /= np.maximum(
-        counts[:, None],
-        1,
-    )
-
-    row_sums = patent_theta.sum(
-        axis=1,
-        keepdims=True,
-    )
-
-    valid_rows = row_sums[:, 0] > 0
-    patent_theta[valid_rows] /= row_sums[valid_rows]
-
-    return (
-        patent_ids,
-        patent_theta.astype(np.float32),
-        counts,
-    )
-
-
-# ------------------------------------------------------------
-# 13. Purity/NMI metrics
-# ------------------------------------------------------------
-
-def calculate_metrics(
-    true_labels,
-    predicted_topics,
-):
-    true_labels = np.asarray(
-        true_labels,
-        dtype=str,
-    )
-
-    predicted_topics = np.asarray(
-        predicted_topics,
-        dtype=np.int64,
-    )
-
-    contingency = pd.crosstab(
-        pd.Series(
-            predicted_topics,
-            name="predicted_topic",
-        ),
-        pd.Series(
-            true_labels,
-            name="true_label",
-        ),
-    )
-
-    number_of_samples = contingency.to_numpy().sum()
-
-    if number_of_samples == 0:
-        raise ValueError(
-            "평가할 sample이 없습니다."
+    for cluster in np.unique(predicted_clusters):
+        mask = predicted_clusters == cluster
+        _, counts = np.unique(
+            true_labels[mask],
+            return_counts=True,
         )
+        correct += int(counts.max())
 
-    # Predicted-cluster purity
-    pur_p = (
-        contingency.max(axis=1).sum()
-        / number_of_samples
-    )
+    return float(correct / len(true_labels))
 
-    # Inverse label-wise purity
-    pur_a = (
-        contingency.max(axis=0).sum()
-        / number_of_samples
-    )
+def inverse_label_purity(true_labels, predicted_clusters):
+    true_labels = np.asarray(true_labels)
+    predicted_clusters = np.asarray(predicted_clusters)
 
-    nmi = normalized_mutual_info_score(
-        true_labels,
-        predicted_topics,
-        average_method="arithmetic",
-    )
+    correct = 0
 
+    for label in np.unique(true_labels):
+        mask = true_labels == label
+        _, counts = np.unique(
+            predicted_clusters[mask],
+            return_counts=True,
+        )
+        correct += int(counts.max())
+
+    return float(correct / len(true_labels))
+
+def evaluate_level(true_labels, predicted_clusters):
     return {
-        "pur_p": float(pur_p),
-        "pur_a": float(pur_a),
-        "nmi": float(nmi),
-        "n_samples": int(number_of_samples),
-        "n_predicted_topics": int(
-            np.unique(predicted_topics).size
+        "pur_p": predicted_cluster_purity(
+            true_labels,
+            predicted_clusters,
         ),
-        "n_true_labels": int(
-            np.unique(true_labels).size
+        "pur_a": inverse_label_purity(
+            true_labels,
+            predicted_clusters,
+        ),
+        "nmi": float(
+            normalized_mutual_info_score(
+                true_labels,
+                predicted_clusters,
+                average_method="arithmetic",
+            )
         ),
     }
 
+def evaluate_cpc(predicted_clusters):
+    pred = np.asarray(predicted_clusters)[valid_cpc_mask]
 
-# ------------------------------------------------------------
-# 14. Seed-wise evaluation
-# ------------------------------------------------------------
+    return {
+        "section": evaluate_level(
+            section_labels[valid_cpc_mask],
+            pred,
+        ),
+        "class": evaluate_level(
+            class_labels[valid_cpc_mask],
+            pred,
+        ),
+        "subclass": evaluate_level(
+            subclass_labels[valid_cpc_mask],
+            pred,
+        ),
+    }
 
-metric_rows = []
-prediction_frames = []
-evaluation_failures = []
+# --------------------------------------------------------------------------------------
+# 11. Sparse batch utilities
+# --------------------------------------------------------------------------------------
+def sparse_batch_to_gpu(csr_matrix, indices):
+    dense = csr_matrix[indices].toarray()
+    tensor = torch.from_numpy(dense).float()
+    return tensor.to(DEVICE, non_blocking=True)
 
-for seed in EVAL_SEEDS:
-    print("\n" + "=" * 80)
-    print(f"EVALUATING ECRTM SEED {seed}")
-    print("=" * 80)
+@torch.no_grad()
+def infer_theta(model, csr_matrix, batch_size=512):
+    model.eval()
 
-    try:
-        claim_theta = load_saved_theta(seed)
+    outputs = []
 
-        (
-            patent_ids,
-            patent_theta,
-            patent_claim_counts,
-        ) = aggregate_claim_theta_to_patents(
-            claim_theta,
-            claim_patent_ids,
-            test_nonempty_mask,
+    for start in tqdm(
+        range(0, csr_matrix.shape[0], batch_size),
+        desc="Theta inference",
+        leave=False,
+    ):
+        end = min(start + batch_size, csr_matrix.shape[0])
+        indices = np.arange(start, end)
+
+        batch = sparse_batch_to_gpu(
+            csr_matrix,
+            indices,
         )
 
-        predicted_topics = np.argmax(
-            patent_theta,
-            axis=1,
+        theta = model.get_theta(batch)
+        outputs.append(
+            theta.detach().cpu().numpy().astype(np.float32)
         )
 
-        topic_probabilities = np.max(
-            patent_theta,
-            axis=1,
+        del batch
+        del theta
+
+    return np.concatenate(outputs, axis=0)
+
+def get_beta_numpy(model):
+    model.eval()
+
+    with torch.no_grad():
+        return (
+            model.get_beta()
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float32)
         )
 
-        predictions = pd.DataFrame(
-            {
-                "patent_id": patent_ids.astype(str),
-                "seed": seed,
-                "predicted_topic": predicted_topics,
-                "topic_probability": topic_probabilities,
-                "number_of_claims": patent_claim_counts,
-            }
-        )
+def get_top_words(beta, vocab, num_words=25):
+    vocab_array = np.asarray(vocab)
 
-        merged = predictions.merge(
-            cpc_reference,
-            on="patent_id",
-            how="inner",
-            validate="one_to_one",
-        )
+    rows = []
 
-        if len(merged) == 0:
-            raise ValueError(
-                "CPC reference와 patent predictions의 "
-                "공통 patent_id가 없습니다."
-            )
+    for topic_id, distribution in enumerate(beta):
+        indices = np.argsort(distribution)[::-1][:num_words]
+        words = vocab_array[indices].tolist()
 
-        coverage = len(merged) / len(cpc_reference)
+        rows.append({
+            "topic_id": topic_id,
+            "top_words": " ".join(words),
+        })
 
-        print(
-            f"Matched patents: "
-            f"{len(merged):,}/{len(cpc_reference):,} "
-            f"({coverage:.2%})"
-        )
+    return rows
 
-        if coverage < 0.95:
-            raise ValueError(
-                f"CPC patent coverage가 너무 낮습니다: "
-                f"{coverage:.2%}"
-            )
-
-        for level in [
-            "section",
-            "class",
-            "subclass",
-        ]:
-            metrics = calculate_metrics(
-                merged[level].to_numpy(),
-                merged["predicted_topic"].to_numpy(),
-            )
-
-            metric_row = {
-                "model": "ECRTM",
-                "seed": seed,
-                "level": level,
-                **metrics,
-            }
-
-            metric_rows.append(metric_row)
-
-            print(
-                f"{level:8s} | "
-                f"Pur_p={metrics['pur_p']:.4f} | "
-                f"Pur_a={metrics['pur_a']:.4f} | "
-                f"NMI={metrics['nmi']:.4f} | "
-                f"N={metrics['n_samples']:,}"
-            )
-
-        prediction_frames.append(merged)
-
-        del claim_theta
-        del patent_theta
-        gc.collect()
-
-    except Exception as error:
-        evaluation_failures.append(seed)
-
-        error_message = (
-            f"Evaluation seed {seed} failed: {error}\n"
-            f"{traceback.format_exc()}\n"
-        )
-
-        print(error_message)
-
-        with open(
-            ERROR_LOG_PATH,
-            "a",
-            encoding="utf-8",
-        ) as file:
-            file.write(error_message + "\n")
-
-if evaluation_failures:
-    raise RuntimeError(
-        f"평가 실패 seed: {evaluation_failures}. "
-        f"로그를 확인하세요: {ERROR_LOG_PATH}"
-    )
-
-metrics_df = pd.DataFrame(metric_rows)
-
-if metrics_df.empty:
-    raise RuntimeError(
-        "평가 지표가 생성되지 않았습니다."
-    )
-
-# ------------------------------------------------------------
-# 15. Aggregate scalar metrics across seeds
-# ------------------------------------------------------------
-
-summary_rows = []
-
-for level in [
-    "section",
-    "class",
-    "subclass",
-]:
-    level_frame = metrics_df[
-        metrics_df["level"] == level
-    ]
-
-    for metric in [
-        "pur_p",
-        "pur_a",
-        "nmi",
-    ]:
-        values = level_frame[metric].to_numpy(
-            dtype=float
-        )
-
-        summary_rows.append(
-            {
-                "model": "ECRTM",
-                "level": level,
-                "metric": metric,
-                "mean": float(np.mean(values)),
-                "std": (
-                    float(np.std(values, ddof=1))
-                    if len(values) > 1
-                    else 0.0
-                ),
-                "number_of_seeds": int(len(values)),
-                "seeds": ",".join(
-                    map(
-                        str,
-                        level_frame["seed"].tolist(),
-                    )
-                ),
-            }
-        )
-
-summary_df = pd.DataFrame(summary_rows)
-
-by_seed_output_path = (
-    RESULT_DIR
-    / "ecrtm_patent_cpc_alignment_by_seed.csv"
-)
-
-summary_output_path = (
-    RESULT_DIR
-    / "ecrtm_patent_cpc_alignment_summary.csv"
-)
-
-summary_json_path = (
-    RESULT_DIR
-    / "ecrtm_summary.json"
-)
-
-prediction_output_path = (
-    RESULT_DIR
-    / "ecrtm_patent_predictions_by_seed.csv"
-)
-
-metrics_df.to_csv(
-    by_seed_output_path,
-    index=False,
-)
-
-summary_df.to_csv(
-    summary_output_path,
-    index=False,
-)
-
-if prediction_frames:
-    pd.concat(
-        prediction_frames,
-        ignore_index=True,
-    ).to_csv(
-        prediction_output_path,
-        index=False,
-    )
-
-summary_json = {
+# --------------------------------------------------------------------------------------
+# 12. Configuration
+# --------------------------------------------------------------------------------------
+configuration = {
     "model": "ECRTM",
-    "topics": K,
+    "official_source": "TopMost",
+    "created_at": datetime.now().isoformat(),
+    "project_root": str(PROJECT_ROOT),
+    "train_records": str(TRAIN_RECORD_PATH),
+    "test_records": str(TEST_RECORD_PATH),
+    "train_patents": int(train_bow.shape[0]),
+    "test_patents": int(test_bow.shape[0]),
+    "valid_test_cpc": int(valid_cpc_mask.sum()),
+    "num_topics": NUM_TOPICS,
+    "seeds": SEEDS,
+    "vocab_size": VOCAB_SIZE,
+    "min_doc_count": MIN_DOC_COUNT,
+    "max_doc_freq": MAX_DOC_FREQ,
+    "vocabulary_train_only": True,
     "epochs": EPOCHS,
     "batch_size": BATCH_SIZE,
     "learning_rate": LEARNING_RATE,
-    "evaluation_seeds": EVAL_SEEDS,
-    "training_records": training_records,
-    "failed_training_seeds": failed_seeds,
-    "failed_evaluation_seeds": evaluation_failures,
-    "metrics_by_seed": metrics_df.to_dict(
-        orient="records"
-    ),
-    "metric_summary": summary_df.to_dict(
-        orient="records"
-    ),
-    "paths": {
-        "by_seed_csv": str(by_seed_output_path),
-        "summary_csv": str(summary_output_path),
-        "predictions_csv": str(
-            prediction_output_path
-        ),
-    },
+    "lr_step_size": LR_STEP_SIZE,
+    "lr_gamma": LR_GAMMA,
+    "encoder_units": ENCODER_UNITS,
+    "dropout": DROPOUT,
+    "pretrained_word_embeddings": "glove-wiki-gigaword-200",
+    "embedding_size": EMBED_SIZE,
+    "beta_temp": BETA_TEMP,
+    "weight_loss_ecr": WEIGHT_LOSS_ECR,
+    "sinkhorn_alpha": SINKHORN_ALPHA,
+    "sinkhorn_max_iter": SINKHORN_MAX_ITER,
+    "mixed_precision": False,
+    "gpu": GPU_NAME,
+    "document_unit": "patent",
+    "document_text": "concatenated claims",
+    "cpc_rule": "primary CPC or first CPC",
+    "cpc_in_training": False,
+    "cpc_in_model_selection": False,
+    "checkpoint_interval": CHECKPOINT_INTERVAL,
 }
 
 with open(
-    summary_json_path,
+    RESULT_DIR / "configuration.json",
     "w",
     encoding="utf-8",
-) as file:
+) as f:
     json.dump(
-        summary_json,
-        file,
-        ensure_ascii=False,
+        configuration,
+        f,
         indent=2,
+        ensure_ascii=False,
     )
 
-# ------------------------------------------------------------
-# 16. Final report
-# ------------------------------------------------------------
+label_audit = pd.DataFrame({
+    "patent_id": test_ids,
+    "primary_cpc": test_cpc,
+    "section": section_labels,
+    "class": class_labels,
+    "subclass": subclass_labels,
+    "valid": valid_cpc_mask,
+})
 
-print("\n" + "=" * 80)
-print("ECRTM FINAL RESULTS — MEAN ± STD")
-print("=" * 80)
+label_audit.to_csv(
+    RESULT_DIR / "test_cpc_label_audit.csv",
+    index=False,
+)
 
-for level in [
-    "section",
-    "class",
-    "subclass",
-]:
-    print(f"\n[{level.upper()}]")
+# --------------------------------------------------------------------------------------
+# 13. Three-seed training with automatic resume
+# --------------------------------------------------------------------------------------
+all_seed_rows = []
+all_seed_results = []
 
-    level_summary = summary_df[
-        summary_df["level"] == level
-    ]
+total_start = time.time()
 
-    for metric in [
-        "pur_p",
-        "pur_a",
-        "nmi",
-    ]:
-        row = level_summary[
-            level_summary["metric"] == metric
-        ].iloc[0]
+for seed_number, seed in enumerate(SEEDS, start=1):
+    print("\n" + "=" * 100)
+    print(f"ECRTM SEED {seed} — {seed_number}/{len(SEEDS)}")
+    print("=" * 100)
 
-        print(
-            f"{metric:5s}: "
-            f"{row['mean']:.4f} "
-            f"± {row['std']:.4f}"
+    metrics_path = RESULT_DIR / f"seed_{seed}_metrics.json"
+    checkpoint_path = CHECKPOINT_DIR / f"seed_{seed}_latest.pt"
+    final_model_path = CHECKPOINT_DIR / f"seed_{seed}_final.pt"
+
+    # 이미 완료된 seed는 다시 학습하지 않음
+    if metrics_path.exists() and final_model_path.exists():
+        print(f"[SKIP] Seed {seed}는 이미 완료됐습니다.")
+
+        with open(metrics_path, "r", encoding="utf-8") as f:
+            seed_result = json.load(f)
+
+        all_seed_results.append(seed_result)
+
+        for level in ["section", "class", "subclass"]:
+            all_seed_rows.append({
+                "seed": seed,
+                "level": level,
+                "pur_p": seed_result["metrics"][level]["pur_p"],
+                "pur_a": seed_result["metrics"][level]["pur_a"],
+                "nmi": seed_result["metrics"][level]["nmi"],
+                "active_topics": seed_result["active_topics"],
+                "max_topic_share": seed_result["max_topic_share"],
+                "elapsed_seconds": seed_result["elapsed_seconds"],
+                "peak_gpu_gib": seed_result["peak_gpu_gib"],
+            })
+
+        continue
+
+    set_seed(seed)
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+
+    model = ECRTM(
+        vocab_size=VOCAB_SIZE,
+        num_topics=NUM_TOPICS,
+        en_units=ENCODER_UNITS,
+        dropout=DROPOUT,
+        pretrained_WE=pretrained_word_embeddings.copy(),
+        embed_size=EMBED_SIZE,
+        beta_temp=BETA_TEMP,
+        weight_loss_ECR=WEIGHT_LOSS_ECR,
+        sinkhorn_alpha=SINKHORN_ALPHA,
+        sinkhorn_max_iter=SINKHORN_MAX_ITER,
+    ).to(DEVICE)
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=LEARNING_RATE,
+    )
+
+    scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer,
+        step_size=LR_STEP_SIZE,
+        gamma=LR_GAMMA,
+    )
+
+    start_epoch = 1
+    previous_elapsed = 0.0
+
+    # 자동 resume
+    if checkpoint_path.exists():
+        print(f"[RESUME] {checkpoint_path}")
+
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location=DEVICE,
+            weights_only=False,
         )
 
-print("\n=== SAVED FILES ===")
-print("Per-seed metrics :", by_seed_output_path)
-print("Summary metrics  :", summary_output_path)
-print("Summary JSON     :", summary_json_path)
-print("Predictions      :", prediction_output_path)
-print("Error log        :", ERROR_LOG_PATH)
+        model.load_state_dict(
+            checkpoint["model_state_dict"]
+        )
+        optimizer.load_state_dict(
+            checkpoint["optimizer_state_dict"]
+        )
+        scheduler.load_state_dict(
+            checkpoint["scheduler_state_dict"]
+        )
 
-print("\n=== LATEX ROW — MEAN VALUES ONLY ===")
+        start_epoch = int(checkpoint["epoch"]) + 1
+        previous_elapsed = float(
+            checkpoint.get("elapsed_seconds", 0.0)
+        )
 
-latex_values = []
+        print(
+            f"[RESUME] Start epoch={start_epoch}, "
+            f"previous elapsed={previous_elapsed / 3600:.2f}h"
+        )
 
-for level in [
-    "section",
-    "class",
-    "subclass",
-]:
-    for metric in [
-        "pur_p",
-        "pur_a",
-        "nmi",
-    ]:
-        value = summary_df.loc[
-            (
-                summary_df["level"] == level
+    seed_start = time.time()
+
+    num_train = train_bow.shape[0]
+    num_batches = int(np.ceil(num_train / BATCH_SIZE))
+
+    for epoch in range(start_epoch, EPOCHS + 1):
+        model.train()
+
+        permutation = np.random.permutation(num_train)
+
+        epoch_totals = defaultdict(float)
+        epoch_start = time.time()
+
+        progress = tqdm(
+            range(0, num_train, BATCH_SIZE),
+            total=num_batches,
+            desc=f"Seed {seed} Epoch {epoch:03d}/{EPOCHS}",
+            leave=False,
+        )
+
+        for start in progress:
+            indices = permutation[start:start + BATCH_SIZE]
+
+            batch = sparse_batch_to_gpu(
+                train_bow,
+                indices,
             )
-            & (
-                summary_df["metric"] == metric
-            ),
-            "mean",
-        ].iloc[0]
 
-        latex_values.append(f"{value:.4f}")
+            optimizer.zero_grad(set_to_none=True)
 
-print(
-    "ECRTM & "
-    + " & ".join(latex_values)
+            # Sinkhorn 안정성을 위해 FP32
+            output = model(batch)
+            loss = output["loss"]
+
+            if not torch.isfinite(loss):
+                raise FloatingPointError(
+                    f"Non-finite loss: seed={seed}, epoch={epoch}, "
+                    f"batch_start={start}, loss={loss.item()}"
+                )
+
+            loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=5.0,
+            )
+
+            optimizer.step()
+
+            batch_size_actual = len(indices)
+
+            for key, value in output.items():
+                epoch_totals[key] += (
+                    float(value.detach().cpu())
+                    * batch_size_actual
+                )
+
+            progress.set_postfix({
+                "loss": f"{float(loss.detach().cpu()):.3f}",
+                "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
+                "gpu": (
+                    f"{torch.cuda.memory_allocated() / (1024**3):.1f}G"
+                ),
+            })
+
+            del batch
+            del output
+            del loss
+
+        scheduler.step()
+
+        epoch_elapsed = time.time() - epoch_start
+
+        mean_loss = epoch_totals["loss"] / num_train
+        mean_tm = epoch_totals.get("loss_TM", 0.0) / num_train
+        mean_ecr = epoch_totals.get("loss_ECR", 0.0) / num_train
+
+        print(
+            f"[SEED {seed} EPOCH {epoch:03d}/{EPOCHS}] "
+            f"loss={mean_loss:.6f} | "
+            f"TM={mean_tm:.6f} | "
+            f"ECR={mean_ecr:.6f} | "
+            f"lr={optimizer.param_groups[0]['lr']:.3e} | "
+            f"time={epoch_elapsed / 60:.1f}m"
+        )
+
+        if (
+            epoch % CHECKPOINT_INTERVAL == 0
+            or epoch == EPOCHS
+        ):
+            elapsed = (
+                previous_elapsed
+                + time.time()
+                - seed_start
+            )
+
+            temp_path = checkpoint_path.with_suffix(".tmp.pt")
+
+            torch.save({
+                "seed": seed,
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "elapsed_seconds": elapsed,
+                "configuration": configuration,
+                "vocab": vocab,
+            }, temp_path)
+
+            os.replace(temp_path, checkpoint_path)
+
+            print(
+                f"[CHECKPOINT] Seed={seed}, epoch={epoch}: "
+                f"{checkpoint_path}"
+            )
+
+    total_seed_elapsed = (
+        previous_elapsed
+        + time.time()
+        - seed_start
+    )
+
+    # ----------------------------------------------------------------------------------
+    # Final inference
+    # ----------------------------------------------------------------------------------
+    print(f"[INFERENCE] Seed {seed} train theta")
+    train_theta = infer_theta(
+        model,
+        train_bow,
+        INFERENCE_BATCH_SIZE,
+    )
+
+    print(f"[INFERENCE] Seed {seed} test theta")
+    test_theta = infer_theta(
+        model,
+        test_bow,
+        INFERENCE_BATCH_SIZE,
+    )
+
+    beta = get_beta_numpy(model)
+    predicted_topics = test_theta.argmax(axis=1)
+
+    metrics = evaluate_cpc(predicted_topics)
+
+    topic_counts = np.bincount(
+        predicted_topics,
+        minlength=NUM_TOPICS,
+    )
+
+    active_topics = int(
+        np.count_nonzero(topic_counts)
+    )
+    max_topic_share = float(
+        topic_counts.max() / topic_counts.sum()
+    )
+
+    peak_gpu_gib = (
+        torch.cuda.max_memory_allocated() / (1024 ** 3)
+    )
+
+    # Arrays
+    np.save(
+        ARRAY_DIR / f"seed_{seed}_train_theta.npy",
+        train_theta.astype(np.float32),
+    )
+    np.save(
+        ARRAY_DIR / f"seed_{seed}_test_theta.npy",
+        test_theta.astype(np.float32),
+    )
+    np.save(
+        ARRAY_DIR / f"seed_{seed}_beta.npy",
+        beta.astype(np.float32),
+    )
+    np.save(
+        ARRAY_DIR / f"seed_{seed}_test_assignments.npy",
+        predicted_topics.astype(np.int16),
+    )
+
+    # Topic words
+    topic_rows = get_top_words(
+        beta,
+        vocab,
+        NUM_TOP_WORDS,
+    )
+
+    pd.DataFrame(topic_rows).to_csv(
+        TOPIC_DIR / f"seed_{seed}_top_words.csv",
+        index=False,
+    )
+
+    seed_result = {
+        "seed": seed,
+        "metrics": metrics,
+        "active_topics": active_topics,
+        "max_topic_share": max_topic_share,
+        "elapsed_seconds": total_seed_elapsed,
+        "peak_gpu_gib": peak_gpu_gib,
+        "train_theta_shape": list(train_theta.shape),
+        "test_theta_shape": list(test_theta.shape),
+        "beta_shape": list(beta.shape),
+    }
+
+    with open(
+        metrics_path,
+        "w",
+        encoding="utf-8",
+    ) as f:
+        json.dump(
+            seed_result,
+            f,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    # Final model
+    torch.save({
+        "seed": seed,
+        "epoch": EPOCHS,
+        "model_state_dict": model.state_dict(),
+        "configuration": configuration,
+        "vocab": vocab,
+        "metrics": metrics,
+    }, final_model_path)
+
+    all_seed_results.append(seed_result)
+
+    for level in ["section", "class", "subclass"]:
+        all_seed_rows.append({
+            "seed": seed,
+            "level": level,
+            "pur_p": metrics[level]["pur_p"],
+            "pur_a": metrics[level]["pur_a"],
+            "nmi": metrics[level]["nmi"],
+            "active_topics": active_topics,
+            "max_topic_share": max_topic_share,
+            "elapsed_seconds": total_seed_elapsed,
+            "peak_gpu_gib": peak_gpu_gib,
+        })
+
+    print("-" * 100)
+    print(f"[SEED {seed} FINAL CPC ALIGNMENT]")
+    print(
+        f"Section : Pur_p={metrics['section']['pur_p']:.4f} | "
+        f"Pur_a={metrics['section']['pur_a']:.4f} | "
+        f"NMI={metrics['section']['nmi']:.4f}"
+    )
+    print(
+        f"Class   : Pur_p={metrics['class']['pur_p']:.4f} | "
+        f"Pur_a={metrics['class']['pur_a']:.4f} | "
+        f"NMI={metrics['class']['nmi']:.4f}"
+    )
+    print(
+        f"Subclass: Pur_p={metrics['subclass']['pur_p']:.4f} | "
+        f"Pur_a={metrics['subclass']['pur_a']:.4f} | "
+        f"NMI={metrics['subclass']['nmi']:.4f}"
+    )
+    print(
+        f"Active topics={active_topics}/{NUM_TOPICS} | "
+        f"max share={max_topic_share:.2%} | "
+        f"GPU peak={peak_gpu_gib:.2f} GiB | "
+        f"time={total_seed_elapsed / 3600:.2f}h"
+    )
+    print("-" * 100)
+
+    del model
+    del optimizer
+    del scheduler
+    del train_theta
+    del test_theta
+    del beta
+    del predicted_topics
+
+    gc.collect()
+    torch.cuda.empty_cache()
+
+# --------------------------------------------------------------------------------------
+# 14. Aggregate results
+# --------------------------------------------------------------------------------------
+seed_df = pd.DataFrame(all_seed_rows)
+
+seed_df.to_csv(
+    RESULT_DIR / "ecrtm_seed_level_results.csv",
+    index=False,
+)
+
+summary_rows = []
+
+for level in ["section", "class", "subclass"]:
+    level_df = seed_df[
+        seed_df["level"] == level
+    ]
+
+    row = {"level": level}
+
+    for metric in ["pur_p", "pur_a", "nmi"]:
+        values = level_df[metric].to_numpy(dtype=float)
+
+        row[f"{metric}_mean"] = float(values.mean())
+        row[f"{metric}_std"] = float(values.std(ddof=1))
+        row[f"{metric}_min"] = float(values.min())
+        row[f"{metric}_max"] = float(values.max())
+
+    summary_rows.append(row)
+
+summary_df = pd.DataFrame(summary_rows)
+
+summary_df.to_csv(
+    RESULT_DIR / "ecrtm_3seed_summary.csv",
+    index=False,
+)
+
+complete_result = {
+    "configuration": configuration,
+    "seed_results": all_seed_results,
+    "summary": summary_rows,
+    "total_elapsed_seconds": time.time() - total_start,
+}
+
+with open(
+    RESULT_DIR / "ecrtm_3seed_complete_results.json",
+    "w",
+    encoding="utf-8",
+) as f:
+    json.dump(
+        complete_result,
+        f,
+        indent=2,
+        ensure_ascii=False,
+    )
+
+# --------------------------------------------------------------------------------------
+# 15. Final report and LaTeX row
+# --------------------------------------------------------------------------------------
+def summary_value(level, metric, statistic="mean"):
+    row = summary_df[
+        summary_df["level"] == level
+    ].iloc[0]
+
+    return float(row[f"{metric}_{statistic}"])
+
+print("\n" + "=" * 100)
+print("ECRTM 3-SEED FINAL CPC ALIGNMENT")
+print("=" * 100)
+
+for title, level in [
+    ("SECTION", "section"),
+    ("CLASS", "class"),
+    ("SUBCLASS", "subclass"),
+]:
+    print(f"\n[{title}]")
+
+    for metric_title, metric in [
+        ("Pur_p", "pur_p"),
+        ("Pur_a", "pur_a"),
+        ("NMI", "nmi"),
+    ]:
+        mean = summary_value(level, metric)
+        std = summary_value(level, metric, "std")
+
+        print(
+            f"{metric_title:<5} = {mean:.4f} ± {std:.4f}"
+        )
+
+latex_mean = (
+    "ECRTM "
+    + " & ".join(
+        f"{summary_value(level, metric):.4f}"
+        for level in ["section", "class", "subclass"]
+        for metric in ["pur_p", "pur_a", "nmi"]
+    )
     + r" \\"
 )
 
-print("\n[DONE] ECRTM training and evaluation completed.")
+latex_mean_std = (
+    "ECRTM "
+    + " & ".join(
+        f"${summary_value(level, metric):.4f}"
+        f"\\pm{summary_value(level, metric, 'std'):.4f}$"
+        for level in ["section", "class", "subclass"]
+        for metric in ["pur_p", "pur_a", "nmi"]
+    )
+    + r" \\"
+)
+
+with open(
+    RESULT_DIR / "latex_row_mean.txt",
+    "w",
+    encoding="utf-8",
+) as f:
+    f.write(latex_mean + "\n")
+
+with open(
+    RESULT_DIR / "latex_row_mean_std.txt",
+    "w",
+    encoding="utf-8",
+) as f:
+    f.write(latex_mean_std + "\n")
+
+print("\n" + "-" * 100)
+print("[LATEX ROW — MEAN]")
+print(latex_mean)
+
+print("\n[LATEX ROW — MEAN ± STD]")
+print(latex_mean_std)
+
+print("\n[PER-SEED RESULTS]")
+display(seed_df)
+
+print("\n[3-SEED SUMMARY]")
+display(summary_df)
+
+print("\n" + "=" * 100)
+print("[COMPLETE]")
+print(f"Result directory: {RESULT_DIR}")
+print(
+    "Main JSON      : "
+    f"{RESULT_DIR / 'ecrtm_3seed_complete_results.json'}"
+)
+print(
+    "Summary CSV    : "
+    f"{RESULT_DIR / 'ecrtm_3seed_summary.csv'}"
+)
+print(
+    "Seed CSV       : "
+    f"{RESULT_DIR / 'ecrtm_seed_level_results.csv'}"
+)
+print("=" * 100)
