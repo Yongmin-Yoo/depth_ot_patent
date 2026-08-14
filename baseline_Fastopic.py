@@ -1047,13 +1047,32 @@ for seed_index, seed in enumerate(SEEDS, start=1):
         f"epochs={FAST_TOPIC_EPOCHS}"
     )
 
-    # preset embeddings를 사용하므로 seed마다 Transformer embedding을 재계산하지 않음
-    top_words, train_theta = model.fit_transform(
-        train_docs,
-        epochs=FAST_TOPIC_EPOCHS,
-        learning_rate=FAST_TOPIC_LR,
-        preset_doc_embeddings=train_embeddings,
+    # # preset embeddings를 사용하므로 seed마다 Transformer embedding을 재계산하지 않음
+    # top_words, train_theta = model.fit_transform(
+    #     train_docs,
+    #     epochs=FAST_TOPIC_EPOCHS,
+    #     learning_rate=FAST_TOPIC_LR,
+    #     preset_doc_embeddings=train_embeddings,
+    # )
+
+    torch.set_grad_enabled(True)
+
+    print(
+    f"[GRAD CHECK] grad_enabled={torch.is_grad_enabled()}, "
+    f"inference_mode={torch.is_inference_mode_enabled()}"
     )
+
+    with torch.inference_mode(False):
+        with torch.enable_grad():
+            top_words, train_theta = model.fit_transform(
+                train_docs,
+                epochs=FAST_TOPIC_EPOCHS,
+                learning_rate=FAST_TOPIC_LR,
+                preset_doc_embeddings=train_embeddings,
+            )
+
+
+
 
     print(f"[TEST] Transforming {len(test_docs):,} test patents")
 
