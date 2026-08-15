@@ -1,3 +1,57 @@
+# ============================================================
+# FASTopic 1.0.1 NumPy -> Torch transform compatibility patch
+# ============================================================
+import numpy as np
+import torch
+from fastopic import FASTopic
+
+if not getattr(FASTopic.transform, "_numpy_tensor_patch", False):
+    _original_fastopic_transform = FASTopic.transform
+
+    def _patched_fastopic_transform(
+        self,
+        docs=None,
+        doc_embeddings=None,
+        *args,
+        **kwargs,
+    ):
+        if isinstance(doc_embeddings, np.ndarray):
+            try:
+                target_device = next(self.model.parameters()).device
+            except Exception:
+                target_device = torch.device(
+                    getattr(
+                        self,
+                        "device",
+                        "cuda" if torch.cuda.is_available() else "cpu",
+                    )
+                )
+
+            doc_embeddings = torch.tensor(
+                np.asarray(doc_embeddings),
+                dtype=torch.float32,
+                device=target_device,
+            )
+
+        return _original_fastopic_transform(
+            self,
+            docs=docs,
+            doc_embeddings=doc_embeddings,
+            *args,
+            **kwargs,
+        )
+
+    _patched_fastopic_transform._numpy_tensor_patch = True
+    FASTopic.transform = _patched_fastopic_transform
+
+    print("[PATCH APPLIED] FASTopic.transform: NumPy -> Torch Tensor")
+else:
+    print("[PATCH ALREADY ACTIVE]")
+
+print("CUDA available:", torch.cuda.is_available())
+print("Patch status:", getattr(FASTopic.transform, "_numpy_tensor_patch", False))
+
+
 # ======================================================================================
 # FASTopic FAST 3-SEED PATENT CPC BENCHMARK — ONE-CELL COLAB / NVIDIA T4
 #
