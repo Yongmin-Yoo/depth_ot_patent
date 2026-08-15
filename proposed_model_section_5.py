@@ -1,22 +1,188 @@
-# ============================================================
-# SECTION 4/5 BOW FIX — USE NORMALIZED CLAIM BOW
-# ============================================================
+# ==================================================================================================
+# DEPTH-OT V2 — SAFE BOW RESOLVER RECOVERY
+#
+# 목적:
+#   1. 실패한 resolve_batch_tensors hotfix를 복구
+#   2. Section 3의 bow_normalized를 claim_bow로 사용
+#   3. 향후 동일 hotfix가 호출해도 사용할 수 있도록 원본 resolver 백업 생성
+#
+# 모델 가중치와 optimizer state는 변경하지 않습니다.
+# ==================================================================================================
 
 from typing import Any, Dict, Mapping
 import torch
 
 
-def _resolve_batch_tensors_with_normalized_bow(
+# --------------------------------------------------------------------------------------------------
+# 1. Preconditions
+# --------------------------------------------------------------------------------------------------
+
+if "DepthOTV2Model" not in globals():
+    raise RuntimeError(
+        "DepthOTV2Model 클래스가 없습니다. "
+        "Section 4를 먼저 실행하세요."
+    )
+
+if "depth_ot_v2_model" not in globals():
+    raise RuntimeError(
+        "depth_ot_v2_model 인스턴스가 없습니다. "
+        "Section 4를 먼저 실행하세요."
+    )
+
+
+# --------------------------------------------------------------------------------------------------
+# 2. Recovered base resolver
+#    실패한 hotfix나 기존 backup에 의존하지 않고 직접 복구합니다.
+# --------------------------------------------------------------------------------------------------
+
+def _recovered_original_resolve_batch_tensors(
     self,
     batch: Mapping[str, Any],
 ) -> Dict[str, Any]:
-    # Call the original Section 4 resolver, not the failed hotfix.
-    original_resolver = (
-        DepthOTV2Model
-        ._original_resolve_batch_tensors_before_bow_hotfix
+
+    if not isinstance(batch, Mapping):
+        raise TypeError(
+            f"batch must be a Mapping, got "
+            f"{type(batch).__name__}"
+        )
+
+    def first_present(
+        names,
+        *,
+        required=False,
+        description="value",
+    ):
+        for name in names:
+            if (
+                name in batch
+                and batch[name] is not None
+            ):
+                return batch[name]
+
+        if required:
+            raise KeyError(
+                f"Could not find {description}. "
+                f"Tried keys={list(names)}. "
+                f"Available keys={sorted(batch.keys())}"
+            )
+
+        return None
+
+    token_embeddings = first_present(
+        [
+            "token_embeddings",
+            "node_features",
+            "token_features",
+        ],
+        required=True,
+        description="token embeddings",
     )
 
-    resolved = original_resolver(self, batch)
+    token_edge_index = first_present(
+        [
+            "token_edge_index",
+            "graph_edge_index",
+            "edge_index",
+        ],
+        required=True,
+        description="token graph edge index",
+    )
+
+    token_edge_weight = first_present(
+        [
+            "token_edge_weight",
+            "graph_edge_weight",
+            "edge_weight",
+        ],
+        required=False,
+        description="token graph edge weights",
+    )
+
+    token_to_claim = first_present(
+        [
+            "token_to_claim",
+            "node_to_claim",
+            "token_claim_index",
+        ],
+        required=True,
+        description="token-to-claim index",
+    )
+
+    claim_to_patent = first_present(
+        [
+            "claim_to_patent",
+            "claim_patent_index",
+        ],
+        required=True,
+        description="claim-to-patent index",
+    )
+
+    claim_edge_index = first_present(
+        [
+            "claim_edge_index",
+            "dependency_edge_index",
+            "claim_dependency_edge_index",
+        ],
+        required=False,
+        description="claim dependency edge index",
+    )
+
+    claim_depth = first_present(
+        [
+            "claim_depth",
+            "claim_depths",
+            "depth",
+        ],
+        required=False,
+        description="claim depth",
+    )
+
+    # 기본 resolver에서는 기존 이름도 지원합니다.
+    # 실제 normalized BoW 선택은 다음 wrapper에서 강제로 수행합니다.
+    claim_bow = first_present(
+        [
+            "claim_bow",
+            "bow",
+            "bows",
+            "bag_of_words",
+        ],
+        required=False,
+        description="claim bag-of-words",
+    )
+
+    return {
+        "token_embeddings": token_embeddings,
+        "token_edge_index": token_edge_index,
+        "token_edge_weight": token_edge_weight,
+        "token_to_claim": token_to_claim,
+        "claim_to_patent": claim_to_patent,
+        "claim_edge_index": claim_edge_index,
+        "claim_depth": claim_depth,
+        "claim_bow": claim_bow,
+    }
+
+
+# 향후 기존 hotfix 코드가 이 이름을 호출해도 작동하도록 백업 생성
+DepthOTV2Model._original_resolve_batch_tensors_before_bow_hotfix = (
+    _recovered_original_resolve_batch_tensors
+)
+
+
+# --------------------------------------------------------------------------------------------------
+# 3. Final normalized-BoW resolver
+# --------------------------------------------------------------------------------------------------
+
+def _resolve_batch_tensors_with_normalized_bow_safe(
+    self,
+    batch: Mapping[str, Any],
+) -> Dict[str, Any]:
+
+    resolved = (
+        _recovered_original_resolve_batch_tensors(
+            self,
+            batch,
+        )
+    )
 
     if "bow_normalized" not in batch:
         raise KeyError(
@@ -28,70 +194,199 @@ def _resolve_batch_tensors_with_normalized_bow(
 
     if not torch.is_tensor(claim_bow):
         raise TypeError(
-            "`bow_normalized` must be a torch.Tensor."
+            "`bow_normalized` must be a torch.Tensor, "
+            f"got {type(claim_bow).__name__}"
+        )
+
+    claim_to_patent = resolved[
+        "claim_to_patent"
+    ]
+
+    if not torch.is_tensor(claim_to_patent):
+        raise TypeError(
+            "`claim_to_patent` must be a Tensor."
         )
 
     number_of_claims = int(
-        resolved["claim_to_patent"].numel()
+        claim_to_patent.numel()
+    )
+
+    vocabulary_size = int(
+        self.vocabulary_size
     )
 
     expected_shape = (
         number_of_claims,
-        int(self.vocabulary_size),
+        vocabulary_size,
     )
 
     if tuple(claim_bow.shape) != expected_shape:
         raise ValueError(
-            f"bow_normalized shape={tuple(claim_bow.shape)}, "
+            "`bow_normalized` shape mismatch: "
+            f"observed={tuple(claim_bow.shape)}, "
             f"expected={expected_shape}"
         )
 
+    if not claim_bow.is_floating_point():
+        raise TypeError(
+            "`bow_normalized` must have a floating dtype, "
+            f"got {claim_bow.dtype}"
+        )
+
+    if not torch.isfinite(claim_bow).all():
+        raise RuntimeError(
+            "Non-finite values found in bow_normalized."
+        )
+
+    if torch.any(claim_bow < 0):
+        minimum_value = float(
+            claim_bow.min().detach().item()
+        )
+
+        raise RuntimeError(
+            "Negative values found in bow_normalized: "
+            f"minimum={minimum_value}"
+        )
+
+    claim_bow_counts = batch.get(
+        "bow_counts"
+    )
+
+    claim_bow_valid = batch.get(
+        "bow_valid"
+    )
+
+    if (
+        claim_bow_counts is not None
+        and tuple(claim_bow_counts.shape)
+        != expected_shape
+    ):
+        raise ValueError(
+            "`bow_counts` shape mismatch: "
+            f"observed={tuple(claim_bow_counts.shape)}, "
+            f"expected={expected_shape}"
+        )
+
+    if claim_bow_valid is not None:
+        if not torch.is_tensor(claim_bow_valid):
+            raise TypeError(
+                "`bow_valid` must be a Tensor."
+            )
+
+        if tuple(claim_bow_valid.shape) != (
+            number_of_claims,
+        ):
+            raise ValueError(
+                "`bow_valid` shape mismatch: "
+                f"observed={tuple(claim_bow_valid.shape)}, "
+                f"expected={(number_of_claims,)}"
+            )
+
     resolved["claim_bow"] = claim_bow
-    resolved["claim_bow_counts"] = batch.get("bow_counts")
-    resolved["claim_bow_valid"] = batch.get("bow_valid")
-    resolved["claim_bow_source_key"] = "bow_normalized"
+    resolved["claim_bow_counts"] = (
+        claim_bow_counts
+    )
+    resolved["claim_bow_valid"] = (
+        claim_bow_valid
+    )
+    resolved["claim_bow_source_key"] = (
+        "bow_normalized"
+    )
 
     return resolved
 
 
+# 실패한 메서드를 정상 메서드로 교체
 DepthOTV2Model.resolve_batch_tensors = (
-    _resolve_batch_tensors_with_normalized_bow
+    _resolve_batch_tensors_with_normalized_bow_safe
 )
 
 
-# ------------------------------------------------------------
-# Verification
-# ------------------------------------------------------------
+# --------------------------------------------------------------------------------------------------
+# 4. Obtain a sample Section 3 batch
+# --------------------------------------------------------------------------------------------------
+
+if "section4_sample_batch" in globals():
+    sample_batch_for_recovery = (
+        section4_sample_batch
+    )
+
+elif "train_loader" in globals():
+    sample_batch_for_recovery = next(
+        iter(train_loader)
+    )
+
+else:
+    raise RuntimeError(
+        "검증할 sample batch를 찾지 못했습니다. "
+        "Section 3을 먼저 실행하세요."
+    )
+
 
 if "_section5_move_to_device" in globals():
-    sample_batch_for_bow_check = (
+    sample_batch_for_recovery_device = (
         _section5_move_to_device(
-            section4_sample_batch,
+            sample_batch_for_recovery,
             DEVICE,
         )
     )
-else:
-    sample_batch_for_bow_check = _move_to_device(
-        section4_sample_batch,
-        DEVICE,
+
+elif "move_depth_ot_v2_batch" in globals():
+    sample_batch_for_recovery_device = (
+        move_depth_ot_v2_batch(
+            sample_batch_for_recovery,
+            DEVICE,
+        )
     )
+
+elif "_move_to_device" in globals():
+    sample_batch_for_recovery_device = (
+        _move_to_device(
+            sample_batch_for_recovery,
+            DEVICE,
+        )
+    )
+
+else:
+    raise RuntimeError(
+        "Batch device-transfer 함수를 찾지 못했습니다."
+    )
+
+
+# --------------------------------------------------------------------------------------------------
+# 5. Resolver verification
+# --------------------------------------------------------------------------------------------------
 
 depth_ot_v2_model.eval()
 
 with torch.no_grad():
     resolved_check = (
         depth_ot_v2_model.resolve_batch_tensors(
-            sample_batch_for_bow_check
+            sample_batch_for_recovery_device
         )
     )
 
-claim_bow = resolved_check["claim_bow"]
-row_sums = claim_bow.sum(dim=-1)
-valid_mask = row_sums > 0
+claim_bow = resolved_check[
+    "claim_bow"
+]
+claim_bow_counts = resolved_check.get(
+    "claim_bow_counts"
+)
+claim_bow_valid = resolved_check.get(
+    "claim_bow_valid"
+)
 
-if not torch.isfinite(claim_bow).all():
-    raise RuntimeError(
-        "Non-finite values found in bow_normalized."
+row_sums = claim_bow.sum(
+    dim=-1
+)
+
+if claim_bow_valid is not None:
+    valid_mask = (
+        claim_bow_valid.bool()
+    )
+else:
+    valid_mask = (
+        row_sums > 0
     )
 
 if valid_mask.any():
@@ -99,9 +394,13 @@ if valid_mask.any():
         torch.max(
             torch.abs(
                 row_sums[valid_mask]
-                - torch.ones_like(row_sums[valid_mask])
+                - torch.ones_like(
+                    row_sums[valid_mask]
+                )
             )
-        ).item()
+        )
+        .detach()
+        .item()
     )
 else:
     maximum_valid_sum_error = 0.0
@@ -109,29 +408,107 @@ else:
 if maximum_valid_sum_error > 1.0e-4:
     raise RuntimeError(
         "bow_normalized rows do not sum to one. "
-        f"Maximum error={maximum_valid_sum_error:.3e}"
+        f"Maximum error="
+        f"{maximum_valid_sum_error:.3e}"
     )
 
-print("=" * 80)
-print("NORMALIZED CLAIM BOW FIX INSTALLED")
-print("=" * 80)
-print("Selected key          : bow_normalized")
-print(f"BoW shape             : {tuple(claim_bow.shape)}")
-print(f"BoW dtype             : {claim_bow.dtype}")
+
+# --------------------------------------------------------------------------------------------------
+# 6. Full model forward verification
+# --------------------------------------------------------------------------------------------------
+
+with torch.no_grad():
+    recovery_outputs = depth_ot_v2_model(
+        sample_batch_for_recovery_device,
+        sample=False,
+        decode=True,
+    )
+
+if recovery_outputs[
+    "claim_bow"
+] is not claim_bow:
+    raise RuntimeError(
+        "Model output did not retain normalized claim_bow."
+    )
+
+if recovery_outputs[
+    "log_word_probabilities"
+] is None:
+    raise RuntimeError(
+        "Decoder output is missing."
+    )
+
+if recovery_outputs[
+    "beta"
+] is None:
+    raise RuntimeError(
+        "Beta output is missing."
+    )
+
+if not torch.isfinite(
+    recovery_outputs[
+        "log_word_probabilities"
+    ]
+).all():
+    raise RuntimeError(
+        "Decoder produced non-finite values."
+    )
+
+
+# --------------------------------------------------------------------------------------------------
+# 7. Report
+# --------------------------------------------------------------------------------------------------
+
+print("\n" + "=" * 88)
+print("DEPTH-OT V2 NORMALIZED BOW RESOLVER RECOVERED")
+print("=" * 88)
 print(
-    f"Valid BoW rows        : "
-    f"{int(valid_mask.sum().item())}/{claim_bow.shape[0]}"
+    "Selected BoW key      : "
+    f"{resolved_check['claim_bow_source_key']}"
 )
 print(
-    f"Empty BoW rows        : "
-    f"{int((~valid_mask).sum().item())}"
+    "BoW shape             : "
+    f"{tuple(claim_bow.shape)}"
 )
 print(
-    f"Max valid sum error   : "
+    "BoW dtype             : "
+    f"{claim_bow.dtype}"
+)
+print(
+    "Valid BoW rows        : "
+    f"{int(valid_mask.sum().item()):,}/"
+    f"{claim_bow.shape[0]:,}"
+)
+print(
+    "Empty BoW rows        : "
+    f"{int((~valid_mask).sum().item()):,}"
+)
+print(
+    "Max valid sum error   : "
     f"{maximum_valid_sum_error:.3e}"
 )
-print("=" * 80)
-print("[PASS] Section 5 전체 셀을 다시 실행하세요.")
+print(
+    "Decoder output shape  : "
+    f"{tuple(recovery_outputs['log_word_probabilities'].shape)}"
+)
+print(
+    "Beta shape            : "
+    f"{tuple(recovery_outputs['beta'].shape)}"
+)
+print(
+    "Model weights changed : False"
+)
+print("=" * 88)
+print("[PASS] Broken resolver hotfix has been repaired.")
+print("[NEXT] Section 5 전체 셀을 다시 실행하세요.")
+
+# 검증 텐서 정리
+del recovery_outputs
+del resolved_check
+del claim_bow
+
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
 
 
 # ============================================================
