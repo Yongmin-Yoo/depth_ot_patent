@@ -1,3 +1,260 @@
+# ==================================================================================================
+# FORCE RESUME FROM THE ORIGINAL DEPTH-OT V2 RUN
+# ==================================================================================================
+
+from pathlib import Path
+import torch
+import json
+import os
+
+ORIGINAL_RUN_NAME = (
+    "depth_ot_v2_patent_semantic_seed42_20260814_055110"
+)
+
+ORIGINAL_CHECKPOINT_DIR = Path(
+    "/content/drive/MyDrive/depth_ot_patent/checkpoints/depth_ot_v2"
+) / ORIGINAL_RUN_NAME
+
+ORIGINAL_LATEST_PATH = (
+    ORIGINAL_CHECKPOINT_DIR
+    / "latest.pt"
+)
+
+print("=" * 100)
+print("DEPTH-OT V2 ORIGINAL RUN RECOVERY")
+print("=" * 100)
+print("Original run name     :", ORIGINAL_RUN_NAME)
+print("Checkpoint directory  :", ORIGINAL_CHECKPOINT_DIR)
+print("Latest checkpoint     :", ORIGINAL_LATEST_PATH)
+print("Latest exists         :", ORIGINAL_LATEST_PATH.is_file())
+
+if not ORIGINAL_LATEST_PATH.is_file():
+    raise FileNotFoundError(
+        f"Original latest.pt not found:\n"
+        f"{ORIGINAL_LATEST_PATH}"
+    )
+
+# ----------------------------------------------------------------------------------------------
+# 체크포인트 자체 검증
+# ----------------------------------------------------------------------------------------------
+
+checkpoint = torch.load(
+    ORIGINAL_LATEST_PATH,
+    map_location="cpu",
+    weights_only=False,
+)
+
+checkpoint_epoch = checkpoint.get(
+    "epoch",
+    checkpoint.get("epoch_one_based")
+)
+
+checkpoint_run_name = checkpoint.get(
+    "run_name"
+)
+
+print("Checkpoint epoch      :", checkpoint_epoch)
+print("Checkpoint run name   :", checkpoint_run_name)
+print("Checkpoint keys       :", list(checkpoint.keys()))
+
+if checkpoint_run_name != ORIGINAL_RUN_NAME:
+    raise RuntimeError(
+        "Checkpoint run-name mismatch: "
+        f"observed={checkpoint_run_name}, "
+        f"expected={ORIGINAL_RUN_NAME}"
+    )
+
+if checkpoint_epoch is None:
+    raise RuntimeError(
+        "Checkpoint epoch metadata is missing."
+    )
+
+# ----------------------------------------------------------------------------------------------
+# CONFIG run name 복구
+# ----------------------------------------------------------------------------------------------
+
+if "CONFIG" not in globals():
+    raise RuntimeError(
+        "CONFIG가 없습니다. Section 0을 먼저 실행한 후 "
+        "이 복구 셀을 실행하세요."
+    )
+
+print("\nBefore CONFIG.run_name:", getattr(CONFIG, "run_name", None))
+
+CONFIG.run_name = ORIGINAL_RUN_NAME
+
+print("After CONFIG.run_name :", CONFIG.run_name)
+
+# 모델 버전은 그대로 유지
+if hasattr(CONFIG, "model_version"):
+    print("Model version         :", CONFIG.model_version)
+
+# ----------------------------------------------------------------------------------------------
+# 흔히 사용되는 전역 run/checkpoint 경로도 기존 run으로 교정
+# ----------------------------------------------------------------------------------------------
+
+possible_run_name_variables = [
+    "RUN_NAME",
+    "CURRENT_RUN_NAME",
+    "SECTION6_RUN_NAME",
+]
+
+for variable_name in possible_run_name_variables:
+    if variable_name in globals():
+        old_value = globals()[variable_name]
+        globals()[variable_name] = ORIGINAL_RUN_NAME
+
+        print(
+            f"[UPDATED] {variable_name}: "
+            f"{old_value} -> {ORIGINAL_RUN_NAME}"
+        )
+
+possible_checkpoint_directory_variables = [
+    "CHECKPOINT_DIR",
+    "CHECKPOINT_DIRECTORY",
+    "CHECKPOINT_ROOT",
+    "SECTION6_CHECKPOINT_DIR",
+    "SECTION6_CHECKPOINT_DIRECTORY",
+    "RUN_CHECKPOINT_DIR",
+    "RUN_CHECKPOINT_DIRECTORY",
+]
+
+for variable_name in possible_checkpoint_directory_variables:
+    if variable_name in globals():
+        old_value = globals()[variable_name]
+
+        # CHECKPOINT_ROOT처럼 상위 디렉터리일 수 있는 변수는 함부로 바꾸지 않음
+        old_text = str(old_value)
+
+        if (
+            "20260815_055640" in old_text
+            or old_text.endswith(
+                "depth_ot_v2_patent_semantic_seed42_20260815_055640"
+            )
+        ):
+            globals()[variable_name] = (
+                ORIGINAL_CHECKPOINT_DIR
+            )
+
+            print(
+                f"[UPDATED] {variable_name}: "
+                f"{old_value} -> "
+                f"{ORIGINAL_CHECKPOINT_DIR}"
+            )
+
+# ----------------------------------------------------------------------------------------------
+# Section 6에서 사용하는 latest 경로 변수도 교정
+# ----------------------------------------------------------------------------------------------
+
+possible_latest_variables = [
+    "LATEST_CHECKPOINT_PATH",
+    "LATEST_PATH",
+    "SECTION6_LATEST_PATH",
+    "LATEST_CHECKPOINT",
+]
+
+for variable_name in possible_latest_variables:
+    if variable_name in globals():
+        old_value = globals()[variable_name]
+        old_text = str(old_value)
+
+        if (
+            "20260815_055640" in old_text
+            or old_text.endswith("latest.pt")
+        ):
+            globals()[variable_name] = (
+                ORIGINAL_LATEST_PATH
+            )
+
+            print(
+                f"[UPDATED] {variable_name}: "
+                f"{old_value} -> "
+                f"{ORIGINAL_LATEST_PATH}"
+            )
+
+# ----------------------------------------------------------------------------------------------
+# 현재 checkpoint 관련 전역 변수 출력
+# ----------------------------------------------------------------------------------------------
+
+print("\n" + "-" * 100)
+print("CURRENT RUN/CHECKPOINT GLOBALS")
+print("-" * 100)
+
+for variable_name, value in sorted(
+    list(globals().items()),
+    key=lambda item: item[0],
+):
+    upper_name = variable_name.upper()
+
+    if (
+        "CHECKPOINT" in upper_name
+        or upper_name in {
+            "RUN_NAME",
+            "CURRENT_RUN_NAME",
+            "SECTION6_RUN_NAME",
+        }
+    ):
+        if isinstance(
+            value,
+            (str, Path, int, float, bool, type(None)),
+        ):
+            print(
+                f"{variable_name:40s}: "
+                f"{value}"
+            )
+
+# ----------------------------------------------------------------------------------------------
+# 새로 잘못 생성된 run에는 아무것도 복사하지 않음
+# ----------------------------------------------------------------------------------------------
+
+ACCIDENTAL_RUN_NAME = (
+    "depth_ot_v2_patent_semantic_seed42_20260815_055640"
+)
+
+ACCIDENTAL_CHECKPOINT_DIR = Path(
+    "/content/drive/MyDrive/depth_ot_patent/checkpoints/depth_ot_v2"
+) / ACCIDENTAL_RUN_NAME
+
+print("\n" + "-" * 100)
+print("ACCIDENTAL RUN")
+print("-" * 100)
+print("Accidental directory :", ACCIDENTAL_CHECKPOINT_DIR)
+print("Exists               :", ACCIDENTAL_CHECKPOINT_DIR.exists())
+
+if ACCIDENTAL_CHECKPOINT_DIR.exists():
+    accidental_files = list(
+        ACCIDENTAL_CHECKPOINT_DIR.glob("*.pt")
+    )
+
+    print(
+        "Accidental checkpoints:",
+        [path.name for path in accidental_files],
+    )
+
+    print(
+        "[INFO] 이 디렉터리는 현재 삭제하지 않습니다. "
+        "기존 run resume 확인 후 정리할 수 있습니다."
+    )
+
+del checkpoint
+
+print("\n" + "=" * 100)
+print(
+    f"[PASS] CONFIG.run_name restored to "
+    f"{ORIGINAL_RUN_NAME}"
+)
+print(
+    f"[EXPECTED RESUME] Last completed epoch: "
+    f"{checkpoint_epoch}"
+)
+print(
+    f"[EXPECTED START] Epoch: "
+    f"{int(checkpoint_epoch) + 1}"
+)
+print("=" * 100)
+print("[NEXT] Section 6 학습 셀을 다시 실행하세요.")
+
+
 # ============================================================
 # SECTION 6 — DEPTH-OT V2 L4 TRAINING
 # Stage-wise training + resume + local cache + atomic checkpoint
